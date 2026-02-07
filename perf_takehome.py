@@ -250,7 +250,7 @@ class KernelBuilder:
         # ---- Allocate double-buffered shared temp vectors ----
         # Double-buffering prevents WAR dependencies from serializing groups.
         # Even-indexed groups use buffer 0, odd-indexed use buffer 1.
-        N_BUF = 2
+        N_BUF = 16
         vaddr = [self.alloc_scratch(f"vaddr_{b}", VLEN) for b in range(N_BUF)]
         vnode = [self.alloc_scratch(f"vnode_{b}", VLEN) for b in range(N_BUF)]
         vtmp1 = [self.alloc_scratch(f"vtmp1_{b}", VLEN) for b in range(N_BUF)]
@@ -304,8 +304,66 @@ class KernelBuilder:
                         ("+", ptr_val, ptr_val, eight_const)],
             })
 
+        # ---- Preload tree node values for levels 0-2 ----
+        # Level 0: tree[0] - used by rounds 0, 11 (all elements at idx=0)
+        tree_s0 = self.alloc_scratch("tree_s0")
+        v_tree0 = self.alloc_scratch("v_tree0", VLEN)
+        self.instrs.append({"load": [("const", tmp1, forest_values_p_val + 0)]})
+        self.instrs.append({"load": [("load", tree_s0, tmp1)]})
+        self.instrs.append({"valu": [("vbroadcast", v_tree0, tree_s0)]})
+
+        # Level 1: tree[1], tree[2] - used by rounds 1, 12
+        # Selection: node = cond * (tree1 - tree2) + tree2 where cond = idx & 1
+        tree_s1 = self.alloc_scratch("tree_s1")
+        tree_s2 = self.alloc_scratch("tree_s2")
+        diff12_s = self.alloc_scratch("diff12_s")
+        v_tree2_pre = self.alloc_scratch("v_tree2_pre", VLEN)
+        v_diff12 = self.alloc_scratch("v_diff12", VLEN)
+        self.instrs.append({"load": [("const", tmp1, forest_values_p_val + 1),
+                                     ("const", tmp2, forest_values_p_val + 2)]})
+        self.instrs.append({"load": [("load", tree_s1, tmp1),
+                                     ("load", tree_s2, tmp2)]})
+        self.instrs.append({"alu": [("-", diff12_s, tree_s1, tree_s2)]})
+        self.instrs.append({"valu": [("vbroadcast", v_tree2_pre, tree_s2),
+                                     ("vbroadcast", v_diff12, diff12_s)]})
+
+        # Level 2: tree[3..6] - used by rounds 2, 13
+        # Two-level selection using multiply_add
+        tree_s3 = self.alloc_scratch("tree_s3")
+        tree_s4 = self.alloc_scratch("tree_s4")
+        tree_s5 = self.alloc_scratch("tree_s5")
+        tree_s6 = self.alloc_scratch("tree_s6")
+        diff34_s = self.alloc_scratch("diff34_s")
+        diff56_s = self.alloc_scratch("diff56_s")
+        v_tree3_pre = self.alloc_scratch("v_tree3_pre", VLEN)
+        v_tree5_pre = self.alloc_scratch("v_tree5_pre", VLEN)
+        v_diff34 = self.alloc_scratch("v_diff34", VLEN)
+        v_diff56 = self.alloc_scratch("v_diff56", VLEN)
+        v_three = alloc_vec_const("v_three", 3)
+
+        self.instrs.append({"load": [("const", tmp1, forest_values_p_val + 3),
+                                     ("const", tmp2, forest_values_p_val + 4)]})
+        self.instrs.append({"load": [("load", tree_s3, tmp1),
+                                     ("load", tree_s4, tmp2)]})
+        self.instrs.append({"load": [("const", tmp1, forest_values_p_val + 5),
+                                     ("const", tmp2, forest_values_p_val + 6)]})
+        self.instrs.append({"load": [("load", tree_s5, tmp1),
+                                     ("load", tree_s6, tmp2)]})
+        self.instrs.append({"alu": [("-", diff34_s, tree_s4, tree_s3),
+                                    ("-", diff56_s, tree_s6, tree_s5)]})
+        self.instrs.append({"valu": [("vbroadcast", v_tree3_pre, tree_s3),
+                                     ("vbroadcast", v_tree5_pre, tree_s5),
+                                     ("vbroadcast", v_diff34, diff34_s),
+                                     ("vbroadcast", v_diff56, diff56_s)]})
+
         # ---- Phase 2: Main loop - build op graph for scheduler ----
         graph = OpGraph()
+
+        # Determine tree level for each round
+        def tree_level(r):
+            if r <= 10:
+                return r
+            return r - 11
 
         # Mark all vector constant addresses as read-only
         const_addr_ranges = [
@@ -313,6 +371,9 @@ class KernelBuilder:
             (v_mul_4097, VLEN), (v_C0, VLEN), (v_C1, VLEN), (v_19, VLEN),
             (v_mul_33, VLEN), (v_C2, VLEN), (v_C3, VLEN), (v_9, VLEN),
             (v_C4, VLEN), (v_C5, VLEN), (v_16, VLEN),
+            (v_tree0, VLEN), (v_tree2_pre, VLEN), (v_diff12, VLEN),
+            (v_tree3_pre, VLEN), (v_tree5_pre, VLEN),
+            (v_diff34, VLEN), (v_diff56, VLEN), (v_three, VLEN),
         ]
         const_addrs = set()
         for base, length in const_addr_ranges:
@@ -327,6 +388,7 @@ class KernelBuilder:
             return set(range(base, base + VLEN))
 
         for r in range(rounds):
+            level = tree_level(r)
             for g in range(n_groups):
                 vg_idx = vidx[g]
                 vg_val = vval[g]
@@ -337,28 +399,94 @@ class KernelBuilder:
                 vt2 = vtmp2[buf]
                 vb = vtmp_br[buf]
 
-                # -- Address computation (8 ALU ops) --
-                for i in range(VLEN):
+                if level == 0:
+                    # -- Level 0: all at idx=0, use preloaded tree[0] --
                     graph.add_op(
-                        "alu", ("+", va + i, fvp_const, vg_idx + i),
-                        reads={fvp_const, vg_idx + i},
-                        writes={va + i}
+                        "valu", ("^", vg_val, vg_val, v_tree0),
+                        reads=vrange(vg_val) | vrange(v_tree0),
+                        writes=vrange(vg_val)
                     )
-
-                # -- Scattered loads (8 load ops) --
-                for i in range(VLEN):
+                elif level == 1:
+                    # -- Level 1: idx in {1,2}, select from preloaded --
                     graph.add_op(
-                        "load", ("load", vn + i, va + i),
-                        reads={va + i},
-                        writes={vn + i}
+                        "valu", ("&", vn, vg_idx, v_one),
+                        reads=vrange(vg_idx) | vrange(v_one),
+                        writes=vrange(vn)
                     )
-
-                # -- XOR val ^= node_val --
-                graph.add_op(
-                    "valu", ("^", vg_val, vg_val, vn),
-                    reads=vrange(vg_val) | vrange(vn),
-                    writes=vrange(vg_val)
-                )
+                    graph.add_op(
+                        "valu", ("multiply_add", vn, vn, v_diff12, v_tree2_pre),
+                        reads=vrange(vn) | vrange(v_diff12) | vrange(v_tree2_pre),
+                        writes=vrange(vn)
+                    )
+                    graph.add_op(
+                        "valu", ("^", vg_val, vg_val, vn),
+                        reads=vrange(vg_val) | vrange(vn),
+                        writes=vrange(vg_val)
+                    )
+                elif level == 2:
+                    # -- Level 2: idx in {3,4,5,6}, 4-value selection --
+                    graph.add_op(
+                        "valu", ("-", vt1, vg_idx, v_three),
+                        reads=vrange(vg_idx) | vrange(v_three),
+                        writes=vrange(vt1)
+                    )
+                    graph.add_op(
+                        "valu", ("&", vt2, vt1, v_one),
+                        reads=vrange(vt1) | vrange(v_one),
+                        writes=vrange(vt2)
+                    )
+                    graph.add_op(
+                        "valu", (">>", va, vt1, v_one),
+                        reads=vrange(vt1) | vrange(v_one),
+                        writes=vrange(va)
+                    )
+                    graph.add_op(
+                        "valu", ("multiply_add", vn, vt2, v_diff34, v_tree3_pre),
+                        reads=vrange(vt2) | vrange(v_diff34) | vrange(v_tree3_pre),
+                        writes=vrange(vn)
+                    )
+                    graph.add_op(
+                        "valu", ("multiply_add", vt1, vt2, v_diff56, v_tree5_pre),
+                        reads=vrange(vt2) | vrange(v_diff56) | vrange(v_tree5_pre),
+                        writes=vrange(vt1)
+                    )
+                    graph.add_op(
+                        "valu", ("-", vt2, vt1, vn),
+                        reads=vrange(vt1) | vrange(vn),
+                        writes=vrange(vt2)
+                    )
+                    graph.add_op(
+                        "valu", ("multiply_add", vn, va, vt2, vn),
+                        reads=vrange(va) | vrange(vt2) | vrange(vn),
+                        writes=vrange(vn)
+                    )
+                    graph.add_op(
+                        "valu", ("^", vg_val, vg_val, vn),
+                        reads=vrange(vg_val) | vrange(vn),
+                        writes=vrange(vg_val)
+                    )
+                else:
+                    # -- Standard scattered loads --
+                    # Address computation (8 ALU ops)
+                    for i in range(VLEN):
+                        graph.add_op(
+                            "alu", ("+", va + i, fvp_const, vg_idx + i),
+                            reads={fvp_const, vg_idx + i},
+                            writes={va + i}
+                        )
+                    # Scattered loads (8 load ops)
+                    for i in range(VLEN):
+                        graph.add_op(
+                            "load", ("load", vn + i, va + i),
+                            reads={va + i},
+                            writes={vn + i}
+                        )
+                    # XOR val ^= node_val
+                    graph.add_op(
+                        "valu", ("^", vg_val, vg_val, vn),
+                        reads=vrange(vg_val) | vrange(vn),
+                        writes=vrange(vg_val)
+                    )
 
                 # -- Hash stage 0: multiply_add (a*4097 + C0) --
                 graph.add_op(
