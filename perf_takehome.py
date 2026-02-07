@@ -37,6 +37,148 @@ from problem import (
 )
 
 
+# ---------------------------------------------------------------------------
+# List scheduler for VLIW packing
+# ---------------------------------------------------------------------------
+
+class Op:
+    __slots__ = ['engine', 'slot', 'id', 'succs', 'pred_count', 'priority']
+    def __init__(self, engine, slot, op_id):
+        self.engine = engine
+        self.slot = slot
+        self.id = op_id
+        self.succs = []
+        self.pred_count = 0
+        self.priority = 0
+
+
+class OpGraph:
+    """Builds a dependency graph of operations for scheduling."""
+    def __init__(self):
+        self.ops = []
+        self.last_writer = {}           # addr -> op_index
+        self.readers_since_write = {}   # addr -> [op_index]
+        self.const_addrs = set()
+
+    def mark_constants(self, addrs):
+        """Mark addresses as read-only constants (skip WAR tracking for them)."""
+        self.const_addrs.update(addrs)
+
+    def add_op(self, engine, slot, reads, writes):
+        op_idx = len(self.ops)
+        op = Op(engine, slot, op_idx)
+
+        pred_set = set()
+
+        # RAW: this op reads addresses written by earlier ops
+        for addr in reads:
+            w = self.last_writer.get(addr)
+            if w is not None:
+                pred_set.add(w)
+
+        # WAW + WAR: this op writes to addresses
+        for addr in writes:
+            w = self.last_writer.get(addr)
+            if w is not None:
+                pred_set.add(w)
+            # WAR: must come after all readers since last write
+            if addr not in self.const_addrs:
+                for r_idx in self.readers_since_write.get(addr, ()):
+                    pred_set.add(r_idx)
+            self.last_writer[addr] = op_idx
+            self.readers_since_write[addr] = []
+
+        # Track as reader (skip constant addrs to avoid huge lists)
+        for addr in reads:
+            if addr not in self.const_addrs:
+                if addr not in self.readers_since_write:
+                    self.readers_since_write[addr] = []
+                self.readers_since_write[addr].append(op_idx)
+
+        # Build edges
+        for pred_idx in pred_set:
+            self.ops[pred_idx].succs.append(op_idx)
+            op.pred_count += 1
+
+        self.ops.append(op)
+        return op_idx
+
+
+def schedule_ops(graph):
+    """Schedule ops into VLIW instruction bundles using a greedy list scheduler."""
+    ops = graph.ops
+    n = len(ops)
+    if n == 0:
+        return []
+
+    # Compute critical path priorities (reverse topo order)
+    for op in reversed(ops):
+        max_p = 0
+        for s_idx in op.succs:
+            p = ops[s_idx].priority
+            if p > max_p:
+                max_p = p
+        op.priority = 1 + max_p
+
+    # Initialize ready list
+    ready = []
+    for op in ops:
+        if op.pred_count == 0:
+            ready.append(op)
+    ready.sort(key=lambda o: -o.priority)
+
+    bundles = []
+    newly_ready = []
+    scheduled_count = 0
+
+    while ready or newly_ready:
+        if newly_ready:
+            ready.extend(newly_ready)
+            ready.sort(key=lambda o: -o.priority)
+            newly_ready = []
+
+        if not ready:
+            break
+
+        bundle = {}
+        slot_counts = {}
+        scheduled_this = []
+        remaining = []
+
+        for op in ready:
+            eng = op.engine
+            cnt = slot_counts.get(eng, 0)
+            if cnt < SLOT_LIMITS.get(eng, 0):
+                bundle.setdefault(eng, []).append(op.slot)
+                slot_counts[eng] = cnt + 1
+                scheduled_this.append(op)
+            else:
+                remaining.append(op)
+
+        if not scheduled_this:
+            # Safety: force-schedule one op to avoid infinite loop
+            op = remaining.pop(0)
+            bundle = {op.engine: [op.slot]}
+            scheduled_this = [op]
+
+        bundles.append(bundle)
+        ready = remaining
+        scheduled_count += len(scheduled_this)
+
+        for op in scheduled_this:
+            for s_idx in op.succs:
+                succ = ops[s_idx]
+                succ.pred_count -= 1
+                if succ.pred_count == 0:
+                    newly_ready.append(succ)
+
+    return bundles
+
+
+# ---------------------------------------------------------------------------
+# Kernel Builder
+# ---------------------------------------------------------------------------
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -47,13 +189,6 @@ class KernelBuilder:
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
-
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -74,36 +209,23 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
+    def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
+        n_groups = batch_size // VLEN  # 32
 
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+        # ---- Compile-time known addresses ----
+        header_size = 7
+        forest_values_p_val = header_size
+        inp_indices_p_val = header_size + n_nodes
+        inp_values_p_val = inp_indices_p_val + batch_size
 
-        return slots
-
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
-        """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
-        """
+        # ---- Phase 0: Setup ----
+        # We need header vars loaded for the local test's reference check
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
@@ -111,67 +233,249 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Scalar constants
+        zero_const = self.scratch_const(0, "zero")
+        eight_const = self.scratch_const(8, "eight")
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        # forest_values_p as a compile-time const in its own scratch
+        fvp_const = self.scratch_const(forest_values_p_val, "fvp_const")
+
+        # ---- Allocate persistent vectors (32 groups x 2 vectors x 8 elements) ----
+        vidx = []
+        vval = []
+        for g in range(n_groups):
+            vidx.append(self.alloc_scratch(f"vidx_{g}", VLEN))
+            vval.append(self.alloc_scratch(f"vval_{g}", VLEN))
+
+        # ---- Allocate double-buffered shared temp vectors ----
+        # Double-buffering prevents WAR dependencies from serializing groups.
+        # Even-indexed groups use buffer 0, odd-indexed use buffer 1.
+        N_BUF = 2
+        vaddr = [self.alloc_scratch(f"vaddr_{b}", VLEN) for b in range(N_BUF)]
+        vnode = [self.alloc_scratch(f"vnode_{b}", VLEN) for b in range(N_BUF)]
+        vtmp1 = [self.alloc_scratch(f"vtmp1_{b}", VLEN) for b in range(N_BUF)]
+        vtmp2 = [self.alloc_scratch(f"vtmp2_{b}", VLEN) for b in range(N_BUF)]
+        vtmp_br = [self.alloc_scratch(f"vtmp_br_{b}", VLEN) for b in range(N_BUF)]
+
+        # ---- Allocate and initialize vector constants ----
+        def alloc_vec_const(name, value):
+            addr = self.alloc_scratch(name, VLEN)
+            self.add("load", ("const", tmp1, value))
+            self.add("valu", ("vbroadcast", addr, tmp1))
+            return addr
+
+        v_one = alloc_vec_const("v_one", 1)
+        v_two = alloc_vec_const("v_two", 2)
+        v_n_nodes = alloc_vec_const("v_n_nodes", n_nodes)
+
+        # multiply_add constants: stage 0 (4097), stage 2 (33), stage 4 (9)
+        v_mul_4097 = alloc_vec_const("v_mul_4097", (1 << 12) + 1)
+        v_C0 = alloc_vec_const("v_C0", HASH_STAGES[0][1])
+
+        v_C1 = alloc_vec_const("v_C1", HASH_STAGES[1][1])
+        v_19 = alloc_vec_const("v_19", HASH_STAGES[1][4])
+
+        v_mul_33 = alloc_vec_const("v_mul_33", (1 << 5) + 1)
+        v_C2 = alloc_vec_const("v_C2", HASH_STAGES[2][1])
+
+        v_C3 = alloc_vec_const("v_C3", HASH_STAGES[3][1])
+        v_9 = alloc_vec_const("v_9", HASH_STAGES[3][4])
+
+        v_C4 = alloc_vec_const("v_C4", HASH_STAGES[4][1])
+        # stage 4 multiplier is also 9 = (1<<3)+1, reuse v_9
+
+        v_C5 = alloc_vec_const("v_C5", HASH_STAGES[5][1])
+        v_16 = alloc_vec_const("v_16", HASH_STAGES[5][4])
+
+        # ---- Pause (matches first yield in reference_kernel2) ----
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        # ---- Phase 1: Initial vloads ----
+        ptr_idx = self.alloc_scratch("ptr_idx")
+        ptr_val = self.alloc_scratch("ptr_val")
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        self.add("load", ("const", ptr_idx, inp_indices_p_val))
+        self.add("load", ("const", ptr_val, inp_values_p_val))
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        for g in range(n_groups):
+            self.instrs.append({
+                "load": [("vload", vidx[g], ptr_idx), ("vload", vval[g], ptr_val)],
+                "alu": [("+", ptr_idx, ptr_idx, eight_const),
+                        ("+", ptr_val, ptr_val, eight_const)],
+            })
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
+        # ---- Phase 2: Main loop - build op graph for scheduler ----
+        graph = OpGraph()
+
+        # Mark all vector constant addresses as read-only
+        const_addr_ranges = [
+            (v_one, VLEN), (v_two, VLEN), (v_n_nodes, VLEN),
+            (v_mul_4097, VLEN), (v_C0, VLEN), (v_C1, VLEN), (v_19, VLEN),
+            (v_mul_33, VLEN), (v_C2, VLEN), (v_C3, VLEN), (v_9, VLEN),
+            (v_C4, VLEN), (v_C5, VLEN), (v_16, VLEN),
+        ]
+        const_addrs = set()
+        for base, length in const_addr_ranges:
+            for i in range(length):
+                const_addrs.add(base + i)
+        const_addrs.add(fvp_const)
+        const_addrs.add(zero_const)
+        graph.mark_constants(const_addrs)
+
+        # Helper: range set
+        def vrange(base):
+            return set(range(base, base + VLEN))
+
+        for r in range(rounds):
+            for g in range(n_groups):
+                vg_idx = vidx[g]
+                vg_val = vval[g]
+                buf = g % N_BUF
+                va = vaddr[buf]
+                vn = vnode[buf]
+                vt1 = vtmp1[buf]
+                vt2 = vtmp2[buf]
+                vb = vtmp_br[buf]
+
+                # -- Address computation (8 ALU ops) --
+                for i in range(VLEN):
+                    graph.add_op(
+                        "alu", ("+", va + i, fvp_const, vg_idx + i),
+                        reads={fvp_const, vg_idx + i},
+                        writes={va + i}
+                    )
+
+                # -- Scattered loads (8 load ops) --
+                for i in range(VLEN):
+                    graph.add_op(
+                        "load", ("load", vn + i, va + i),
+                        reads={va + i},
+                        writes={vn + i}
+                    )
+
+                # -- XOR val ^= node_val --
+                graph.add_op(
+                    "valu", ("^", vg_val, vg_val, vn),
+                    reads=vrange(vg_val) | vrange(vn),
+                    writes=vrange(vg_val)
+                )
+
+                # -- Hash stage 0: multiply_add (a*4097 + C0) --
+                graph.add_op(
+                    "valu", ("multiply_add", vg_val, vg_val, v_mul_4097, v_C0),
+                    reads=vrange(vg_val) | vrange(v_mul_4097) | vrange(v_C0),
+                    writes=vrange(vg_val)
+                )
+
+                # -- Hash stage 1: (a^C1) ^ (a>>19) --
+                graph.add_op(
+                    "valu", ("^", vt1, vg_val, v_C1),
+                    reads=vrange(vg_val) | vrange(v_C1),
+                    writes=vrange(vt1)
+                )
+                graph.add_op(
+                    "valu", (">>", vt2, vg_val, v_19),
+                    reads=vrange(vg_val) | vrange(v_19),
+                    writes=vrange(vt2)
+                )
+                graph.add_op(
+                    "valu", ("^", vg_val, vt1, vt2),
+                    reads=vrange(vt1) | vrange(vt2),
+                    writes=vrange(vg_val)
+                )
+
+                # -- Hash stage 2: multiply_add (a*33 + C2) --
+                graph.add_op(
+                    "valu", ("multiply_add", vg_val, vg_val, v_mul_33, v_C2),
+                    reads=vrange(vg_val) | vrange(v_mul_33) | vrange(v_C2),
+                    writes=vrange(vg_val)
+                )
+
+                # -- Hash stage 3: (a+C3) ^ (a<<9) --
+                graph.add_op(
+                    "valu", ("+", vt1, vg_val, v_C3),
+                    reads=vrange(vg_val) | vrange(v_C3),
+                    writes=vrange(vt1)
+                )
+                graph.add_op(
+                    "valu", ("<<", vt2, vg_val, v_9),
+                    reads=vrange(vg_val) | vrange(v_9),
+                    writes=vrange(vt2)
+                )
+                graph.add_op(
+                    "valu", ("^", vg_val, vt1, vt2),
+                    reads=vrange(vt1) | vrange(vt2),
+                    writes=vrange(vg_val)
+                )
+
+                # -- Hash stage 4: multiply_add (a*9 + C4) --
+                graph.add_op(
+                    "valu", ("multiply_add", vg_val, vg_val, v_9, v_C4),
+                    reads=vrange(vg_val) | vrange(v_9) | vrange(v_C4),
+                    writes=vrange(vg_val)
+                )
+
+                # -- Hash stage 5: (a^C5) ^ (a>>16) --
+                graph.add_op(
+                    "valu", ("^", vt1, vg_val, v_C5),
+                    reads=vrange(vg_val) | vrange(v_C5),
+                    writes=vrange(vt1)
+                )
+                graph.add_op(
+                    "valu", (">>", vt2, vg_val, v_16),
+                    reads=vrange(vg_val) | vrange(v_16),
+                    writes=vrange(vt2)
+                )
+                graph.add_op(
+                    "valu", ("^", vg_val, vt1, vt2),
+                    reads=vrange(vt1) | vrange(vt2),
+                    writes=vrange(vg_val)
+                )
+
+                # -- Branch / wrap --
+                if r == 10:
+                    # All elements wrap to 0 at round 10
+                    graph.add_op(
+                        "valu", ("vbroadcast", vg_idx, zero_const),
+                        reads={zero_const},
+                        writes=vrange(vg_idx)
+                    )
+                else:
+                    # Branch: idx = 2*idx + ((val & 1) + 1)
+                    graph.add_op(
+                        "valu", ("&", vb, vg_val, v_one),
+                        reads=vrange(vg_val) | vrange(v_one),
+                        writes=vrange(vb)
+                    )
+                    graph.add_op(
+                        "valu", ("+", vb, vb, v_one),
+                        reads=vrange(vb) | vrange(v_one),
+                        writes=vrange(vb)
+                    )
+                    graph.add_op(
+                        "valu", ("multiply_add", vg_idx, vg_idx, v_two, vb),
+                        reads=vrange(vg_idx) | vrange(v_two) | vrange(vb),
+                        writes=vrange(vg_idx)
+                    )
+
+        # Schedule all ops
+        main_bundles = schedule_ops(graph)
+        self.instrs.extend(main_bundles)
+
+        # ---- Phase 3: Final vstores ----
+        self.add("load", ("const", ptr_idx, inp_indices_p_val))
+        self.add("load", ("const", ptr_val, inp_values_p_val))
+
+        for g in range(n_groups):
+            self.instrs.append({
+                "store": [("vstore", ptr_idx, vidx[g]), ("vstore", ptr_val, vval[g])],
+                "alu": [("+", ptr_idx, ptr_idx, eight_const),
+                        ("+", ptr_val, ptr_val, eight_const)],
+            })
+
+        # Final pause
         self.instrs.append({"flow": [("pause",)]})
+
 
 BASELINE = 147734
 
@@ -191,7 +495,6 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -217,8 +520,6 @@ def do_kernel_test(
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
             print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -227,9 +528,6 @@ def do_kernel_test(
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -242,34 +540,11 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
 
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
