@@ -129,19 +129,13 @@ def schedule_ops(graph):
     # Weights (override via env for local tuning).
     W_LOAD = int(os.environ.get("SCHED_W_LOAD", "100000"))
     W_LOAD_DESC = int(os.environ.get("SCHED_W_LOAD_DESC", "10"))
-    W_CP = int(os.environ.get("SCHED_W_CP", "0"))
-    W_GROUP = int(os.environ.get("SCHED_W_GROUP", "1000"))
+    W_GROUP_DEFAULT = int(os.environ.get("SCHED_W_GROUP", "200000"))
 
-    # Compute critical path + load-descendant pressure (reverse topo order)
-    cp = [0] * n
+    # Compute load-descendant pressure (reverse topo order)
     load_desc = [0] * n
     for op in reversed(ops):
-        max_cp = 0
         for s_idx in op.succs:
-            if cp[s_idx] + 1 > max_cp:
-                max_cp = cp[s_idx] + 1
             load_desc[op.id] += load_desc[s_idx]
-        cp[op.id] = max_cp
         if op.engine == "load":
             load_desc[op.id] += 1
 
@@ -150,16 +144,24 @@ def schedule_ops(graph):
         boost = W_LOAD if op.engine == "load" else 0
         # Ops that unlock many downstream loads are often on the throughput-critical spine.
         boost += load_desc[op.id] * W_LOAD_DESC
-        # Stagger groups: lower group numbers get priority boost
-        group_boost = (32 - op.group) * W_GROUP if op.group >= 0 else 0
-        op.priority = boost + group_boost + cp[op.id] * W_CP
+        # Stagger groups: lower group numbers get priority boost.
+        if op.group >= 0:
+            group_boost = (32 - op.group) * W_GROUP_DEFAULT
+        else:
+            group_boost = 0
+        op.priority = boost + group_boost
 
     # Initialize ready lists per engine type
     from heapq import heappush, heappop
     ready_by_eng = defaultdict(list)  # engine -> heap of (-priority, op_id, op)
+
+    def push_ready(op):
+        item = (-op.priority, op.id, op)
+        heappush(ready_by_eng[op.engine], item)
+
     for op in ops:
         if op.pred_count == 0:
-            heappush(ready_by_eng[op.engine], (-op.priority, op.id, op))
+            push_ready(op)
 
     bundles = []
     newly_ready = []
@@ -173,7 +175,7 @@ def schedule_ops(graph):
     while has_ready() or newly_ready:
         if newly_ready:
             for op in newly_ready:
-                heappush(ready_by_eng[op.engine], (-op.priority, op.id, op))
+                push_ready(op)
             newly_ready = []
 
         if not has_ready():
@@ -184,9 +186,9 @@ def schedule_ops(graph):
 
         # Pack each engine type in order of scarcity
         for eng in pack_order:
-            heap = ready_by_eng[eng]
             limit = SLOT_LIMITS.get(eng, 0)
             cnt = 0
+            heap = ready_by_eng[eng]
             while heap and cnt < limit:
                 neg_pri, op_id, op = heappop(heap)
                 bundle.setdefault(eng, []).append(op.slot)
@@ -265,6 +267,7 @@ class KernelBuilder:
 
         # eight_const computed via flow(add_imm) during vec const init
         eight_const = self.alloc_scratch("eight")
+        two_const = self.alloc_scratch("two")
 
         # ---- Allocate persistent vectors (32 groups x 2 vectors x 8 elements) ----
         vidx = []
@@ -315,6 +318,9 @@ class KernelBuilder:
                 # First broadcast cycle: compute eight_const = 0 + 8
                 if i == 2:
                     bundle["flow"] = [("add_imm", eight_const, eight_const, 8)]
+            # Initialize two_const once: two_const = 0 + 2
+            if i == 0:
+                bundle["flow"] = bundle.get("flow", []) + [("add_imm", two_const, two_const, 2)]
             pending_broadcasts = []
             loads = []
             name1, val1 = vec_const_defs[i]
@@ -385,46 +391,39 @@ class KernelBuilder:
         v_tree14 = self.alloc_scratch("v_tree14", VLEN)
         v_l3_cond = self.alloc_scratch("v_l3_cond", VLEN)
 
-        # ---- Load tree values from memory (interleaved pipeline) ----
-        # First tree const loads merged with trailing vec broadcasts above.
-        # Interleave: load(tree, tmpX) + const(tmpX, next_addr) in same cycle.
-        self.instrs.append({"load": [("load", tree_s0, tmp1),
-                                     ("const", tmp1, forest_values_p_val + 2)]})
-        self.instrs.append({"load": [("load", tree_s1, tmp2),
-                                     ("const", tmp2, forest_values_p_val + 3)]})
-        self.instrs.append({"load": [("load", tree_s2, tmp1),
-                                     ("const", tmp1, forest_values_p_val + 4)]})
-        self.instrs.append({"load": [("load", tree_s3, tmp2),
-                                     ("const", tmp2, forest_values_p_val + 5)],
-                            "alu": [("-", diff12_s, tree_s1, tree_s2)]})
-        self.instrs.append({"load": [("load", tree_s4, tmp1),
-                                     ("const", tmp1, forest_values_p_val + 6)]})
-        self.instrs.append({"load": [("load", tree_s5, tmp2),
-                                     ("const", tmp2, forest_values_p_val + 7)],
-                            "alu": [("-", diff34_s, tree_s4, tree_s3)]})
-        self.instrs.append({"load": [("load", tree_s6, tmp1),
-                                     ("const", tmp1, forest_values_p_val + 8)]})
-        self.instrs.append({"load": [("load", tree_s7, tmp2),
-                                     ("const", tmp2, forest_values_p_val + 9)],
-                            "alu": [("-", diff56_s, tree_s6, tree_s5)]})
-        self.instrs.append({"load": [("load", tree_s8, tmp1),
-                                     ("const", tmp1, forest_values_p_val + 10)]})
-        self.instrs.append({"load": [("load", tree_s9, tmp2),
-                                     ("const", tmp2, forest_values_p_val + 11)]})
-        self.instrs.append({"load": [("load", tree_s10, tmp1),
-                                     ("const", tmp1, forest_values_p_val + 12)]})
-        self.instrs.append({"load": [("load", tree_s11, tmp2),
-                                     ("const", tmp2, forest_values_p_val + 13)]})
-        self.instrs.append({"load": [("load", tree_s12, tmp1),
-                                     ("const", tmp1, forest_values_p_val + 14)]})
-        self.instrs.append({"load": [("load", tree_s13, tmp2),
-                                     ("const", ptr_idx, inp_indices_p_val)]})
-        self.instrs.append({"load": [("load", tree_s14, tmp1),
-                                     ("const", ptr_val, inp_values_p_val)]})
-
-        # ---- Pause + const(3) (merged) ----
-        self.instrs.append({"flow": [("pause",)],
-                            "load": [("const", tmp2, 3)]})
+        # ---- Load tree values from memory (pipelined pointers; no per-load consts) ----
+        # tmp1/tmp2 already hold forest_values_p_val+0/+1 from the trailing vec-const bundle.
+        # Use ALU to bump both pointers by 2 so the load engine can do 2 memory loads/cycle.
+        tree_scalars = [
+            tree_s0, tree_s1, tree_s2, tree_s3, tree_s4, tree_s5, tree_s6, tree_s7,
+            tree_s8, tree_s9, tree_s10, tree_s11, tree_s12, tree_s13, tree_s14,
+        ]
+        for k in range(0, len(tree_scalars), 2):
+            bundle = {
+                "load": [("load", tree_scalars[k], tmp1)],
+                "alu": [("+", tmp1, tmp1, two_const), ("+", tmp2, tmp2, two_const)],
+            }
+            if k + 1 < len(tree_scalars):
+                bundle["load"].append(("load", tree_scalars[k + 1], tmp2))
+            # Build v_three once (used by level-2): v_three = v_one + v_two
+            if k == 0:
+                bundle["valu"] = [("+", v_three, v_one, v_two)]
+            # Scalar diffs become available one cycle after the 2nd operand load.
+            if k == 4:
+                bundle["alu"].append(("-", diff12_s, tree_s1, tree_s2))
+            elif k == 6:
+                bundle["alu"].append(("-", diff34_s, tree_s4, tree_s3))
+            elif k == 8:
+                bundle["alu"].append(("-", diff56_s, tree_s6, tree_s5))
+            # Initialize input pointers via flow (scratch starts at 0).
+            if k == 12:
+                bundle["flow"] = [("add_imm", ptr_idx, ptr_idx, inp_indices_p_val)]
+            elif k == 14:
+                # Use the spare load slot (only 1 scalar tree load this cycle) to init ptr_val,
+                # and pause here so external harnesses can treat the next phase as "kernel body".
+                bundle["load"].append(("const", ptr_val, inp_values_p_val))
+                bundle["flow"] = [("pause",)]
+            self.instrs.append(bundle)
 
         tree_bc = [
             ("vbroadcast", v_tree0, tree_s0),
@@ -434,7 +433,6 @@ class KernelBuilder:
             ("vbroadcast", v_tree5_pre, tree_s5),
             ("vbroadcast", v_diff34, diff34_s),
             ("vbroadcast", v_diff56, diff56_s),
-            ("vbroadcast", v_three, tmp2),  # tmp2 has 3 from tree loading
             ("vbroadcast", v_tree7, tree_s7),
             ("vbroadcast", v_tree8, tree_s8),
             ("vbroadcast", v_tree9, tree_s9),
@@ -592,15 +590,10 @@ class KernelBuilder:
                         writes=vrange(vb), group=g
                     )
 
-                    # b1 = (w >> 1) & 1  -> v_l3_cond
+                    # b1 = w & 2  (nonzero => true for vselect)
                     graph.add_op(
-                        "valu", (">>", v_l3_cond, va, v_one),
-                        reads=vrange(va) | vrange(v_one),
-                        writes=vrange(v_l3_cond), group=g
-                    )
-                    graph.add_op(
-                        "valu", ("&", v_l3_cond, v_l3_cond, v_one),
-                        reads=vrange(v_l3_cond) | vrange(v_one),
+                        "valu", ("&", v_l3_cond, va, v_two),
+                        reads=vrange(va) | vrange(v_two),
                         writes=vrange(v_l3_cond), group=g
                     )
 
@@ -633,22 +626,6 @@ class KernelBuilder:
                         writes=vrange(vb), group=g
                     )
 
-                    # Recompute b1 into v_l3_cond: b1 = ((idx + 1) >> 1) & 1
-                    graph.add_op(
-                        "valu", ("+", v_l3_cond, vg_idx, v_one),
-                        reads=vrange(vg_idx) | vrange(v_one),
-                        writes=vrange(v_l3_cond), group=g
-                    )
-                    graph.add_op(
-                        "valu", (">>", v_l3_cond, v_l3_cond, v_one),
-                        reads=vrange(v_l3_cond) | vrange(v_one),
-                        writes=vrange(v_l3_cond), group=g
-                    )
-                    graph.add_op(
-                        "valu", ("&", v_l3_cond, v_l3_cond, v_one),
-                        reads=vrange(v_l3_cond) | vrange(v_one),
-                        writes=vrange(v_l3_cond), group=g
-                    )
                     graph.add_op(
                         "flow", ("vselect", va, v_l3_cond, vb, va),
                         reads=vrange(v_l3_cond) | vrange(vb) | vrange(va),
@@ -801,47 +778,38 @@ class KernelBuilder:
             reads=set(), writes={ptr_val}, group=-1
         )
 
-        prev_inc_idx = None
         for g in range(n_groups):
             vg_idx = vidx[g]
             vg_val = vval[g]
             # 2 separate store ops per group
-            preds = [ptr_idx_load, ptr_val_load]
-            if prev_inc_idx is not None:
-                preds.append(prev_inc_idx)
-
             s_idx = graph.add_op(
                 "store", ("vstore", ptr_idx, vg_idx),
                 reads=vrange(vg_idx) | {ptr_idx}, writes=set(), group=-1,
-                extra_preds=preds
+                extra_preds=[ptr_idx_load]
             )
             s_val = graph.add_op(
                 "store", ("vstore", ptr_val, vg_val),
                 reads=vrange(vg_val) | {ptr_val}, writes=set(), group=-1,
-                extra_preds=preds
+                extra_preds=[ptr_val_load]
             )
             # ALU increments after stores
             inc_idx = graph.add_op(
                 "alu", ("+", ptr_idx, ptr_idx, eight_const),
                 reads={ptr_idx, eight_const}, writes={ptr_idx}, group=-1,
-                extra_preds=[s_idx, s_val]
+                extra_preds=[s_idx]
             )
-            prev_inc_idx = graph.add_op(
+            inc_val = graph.add_op(
                 "alu", ("+", ptr_val, ptr_val, eight_const),
                 reads={ptr_val, eight_const}, writes={ptr_val}, group=-1,
-                extra_preds=[s_idx, s_val]
+                extra_preds=[s_val]
             )
-
-        # Final pause
-        graph.add_op(
-            "flow", ("pause",),
-            reads=set(), writes=set(), group=-1,
-            extra_preds=[prev_inc_idx] if prev_inc_idx is not None else []
-        )
 
         # Schedule all ops (main body + stores + pause)
         self.last_graph = graph
         all_bundles = schedule_ops(graph)
+        # Final pause (without adding an extra cycle): merge into the last bundle.
+        if all_bundles:
+            all_bundles[-1].setdefault("flow", []).append(("pause",))
         self.instrs.extend(all_bundles)
 
 
