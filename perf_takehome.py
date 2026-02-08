@@ -371,7 +371,6 @@ class KernelBuilder:
         ptr_idx = self.alloc_scratch("ptr_idx")
         ptr_val = self.alloc_scratch("ptr_val")
         tree_s0 = self.alloc_scratch("tree_s0")
-        v_tree0 = self.alloc_scratch("v_tree0", VLEN)
         tree_s1 = self.alloc_scratch("tree_s1")
         tree_s2 = self.alloc_scratch("tree_s2")
         # Reuse a few tree scalar slots to hold scalar diffs (saves 3 scratch words):
@@ -430,9 +429,7 @@ class KernelBuilder:
                 bundle["valu"] = [("+", v_three, v_one, v_two)]
             # Pipeline vbroadcasts for the preloaded tree constants into otherwise VALU-idle
             # prologue cycles. Sources become available 1 cycle after their scalar load / diff.
-            if k == 2:
-                bundle.setdefault("valu", []).append(("vbroadcast", v_tree0, tree_s0))
-            elif k == 4:
+            if k == 4:
                 bundle.setdefault("valu", []).extend([
                     ("vbroadcast", v_tree2_pre, tree_s2),
                     ("vbroadcast", v_tree3_pre, tree_s3),
@@ -515,7 +512,7 @@ class KernelBuilder:
             (v_mul_4097, VLEN), (v_C0, VLEN), (v_19, VLEN),
             (v_mul_33, VLEN), (v_C2, VLEN), (v_9, VLEN),
             (v_C4, VLEN), (v_16, VLEN), (v_fvp, VLEN),
-            (v_tree0, VLEN), (v_tree2_pre, VLEN), (v_diff12, VLEN),
+            (v_tree2_pre, VLEN), (v_diff12, VLEN),
             (v_tree3_pre, VLEN), (v_tree5_pre, VLEN),
             (v_diff34, VLEN), (v_diff56, VLEN), (v_three, VLEN),
             (v_tree7, VLEN), (v_tree8, VLEN), (v_tree9, VLEN), (v_tree10, VLEN),
@@ -580,11 +577,13 @@ class KernelBuilder:
                 vb = vtC[g]     # per-group branch bit (shortens coupling)
 
                 if level == 0:
-                    graph.add_op(
-                        "valu", ("^", vg_val, vg_val, v_tree0),
-                        reads=vrange(vg_val) | vrange(v_tree0),
-                        writes=vrange(vg_val), group=g
-                    )
+                    # tree[0] is a scalar: don't spend scratch on a full vector broadcast.
+                    for i in range(VLEN):
+                        graph.add_op(
+                            "alu", ("^", vg_val + i, vg_val + i, tree_s0),
+                            reads={vg_val + i, tree_s0},
+                            writes={vg_val + i}, group=g
+                        )
                 elif level == 1:
                     graph.add_op(
                         "valu", ("&", vn, vg_idx, v_one),
