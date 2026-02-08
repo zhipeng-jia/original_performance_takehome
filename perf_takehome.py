@@ -309,6 +309,7 @@ class KernelBuilder:
         vec_const_defs = [
             ("v_one", 1),
             ("v_two", 2),
+            ("v_four", 4),
             ("v_mul_4097", (1 << 12) + 1),
             ("v_C0", HASH_STAGES[0][1]),
             ("v_19", HASH_STAGES[1][4]),
@@ -357,6 +358,7 @@ class KernelBuilder:
 
         v_one = vec_const_addrs["v_one"]
         v_two = vec_const_addrs["v_two"]
+        v_four = vec_const_addrs["v_four"]
         v_mul_4097 = vec_const_addrs["v_mul_4097"]
         v_C0 = vec_const_addrs["v_C0"]
         v_19 = vec_const_addrs["v_19"]
@@ -508,7 +510,7 @@ class KernelBuilder:
 
         # Mark all vector constant addresses as read-only
         const_addr_ranges = [
-            (v_one, VLEN), (v_two, VLEN),
+            (v_one, VLEN), (v_two, VLEN), (v_four, VLEN),
             (v_mul_4097, VLEN), (v_C0, VLEN), (v_19, VLEN),
             (v_mul_33, VLEN), (v_C2, VLEN), (v_9, VLEN),
             (v_C4, VLEN), (v_16, VLEN), (v_fvp, VLEN),
@@ -659,15 +661,10 @@ class KernelBuilder:
                         reads=vrange(va) | vrange(v_two),
                         writes=vrange(v_l3_cond1), group=g
                     )
-                    # b2 = ((w >> 1) & 2)  (nonzero => true for vselect)
+                    # b2 = w & 4  (nonzero => true for vselect)
                     graph.add_op(
-                        "valu", (">>", vb, va, v_one),
-                        reads=vrange(va) | vrange(v_one),
-                        writes=vrange(vb), group=g
-                    )
-                    graph.add_op(
-                        "valu", ("&", vb, vb, v_two),
-                        reads=vrange(vb) | vrange(v_two),
+                        "valu", ("&", vb, va, v_four),
+                        reads=vrange(va) | vrange(v_four),
                         writes=vrange(vb), group=g
                     )
 
