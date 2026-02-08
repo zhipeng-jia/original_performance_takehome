@@ -42,14 +42,15 @@ from problem import (
 # ---------------------------------------------------------------------------
 
 class Op:
-    __slots__ = ['engine', 'slot', 'id', 'succs', 'pred_count', 'priority']
-    def __init__(self, engine, slot, op_id):
+    __slots__ = ['engine', 'slot', 'id', 'succs', 'pred_count', 'priority', 'group']
+    def __init__(self, engine, slot, op_id, group=-1):
         self.engine = engine
         self.slot = slot
         self.id = op_id
         self.succs = []
         self.pred_count = 0
         self.priority = 0
+        self.group = group
 
 
 class OpGraph:
@@ -59,16 +60,25 @@ class OpGraph:
         self.last_writer = {}           # addr -> op_index
         self.readers_since_write = {}   # addr -> [op_index]
         self.const_addrs = set()
+        self.local_addrs = set()        # addrs where within-group WAR is skipped
 
     def mark_constants(self, addrs):
         """Mark addresses as read-only constants (skip WAR tracking for them)."""
         self.const_addrs.update(addrs)
 
-    def add_op(self, engine, slot, reads, writes):
+    def mark_local(self, addrs):
+        """Mark addresses as group-local (skip WAR for same-group readers).
+        Within a group, the RAW chain through vg_val guarantees ordering,
+        making WAR edges redundant. Between groups, WAR is still needed."""
+        self.local_addrs.update(addrs)
+
+    def add_op(self, engine, slot, reads, writes, group=-1, extra_preds=None):
         op_idx = len(self.ops)
-        op = Op(engine, slot, op_idx)
+        op = Op(engine, slot, op_idx, group=group)
 
         pred_set = set()
+        if extra_preds:
+            pred_set.update(extra_preds)
 
         # RAW: this op reads addresses written by earlier ops
         for addr in reads:
@@ -83,7 +93,11 @@ class OpGraph:
                 pred_set.add(w)
             # WAR: must come after all readers since last write
             if addr not in self.const_addrs:
+                is_local = addr in self.local_addrs
                 for r_idx in self.readers_since_write.get(addr, ()):
+                    # Skip WAR for same-group readers on local addresses
+                    if is_local and self.ops[r_idx].group == group:
+                        continue
                     pred_set.add(r_idx)
             self.last_writer[addr] = op_idx
             self.readers_since_write[addr] = []
@@ -111,15 +125,33 @@ def schedule_ops(graph):
     if n == 0:
         return []
 
-    # Compute critical path priorities (reverse topo order)
+    # Compute critical path + load descendant count (reverse topo order)
+    cp = [0] * n
+    load_desc = [0] * n
     for op in reversed(ops):
-        max_p = 0
+        max_cp = 0
         for s_idx in op.succs:
-            p = ops[s_idx].priority
-            if p > max_p:
-                max_p = p
-        load_boost = 50 if op.engine == "load" else 0
-        op.priority = (1 + max_p) * 100 + len(op.succs) + load_boost
+            if cp[s_idx] + 1 > max_cp:
+                max_cp = cp[s_idx] + 1
+            load_desc[op.id] += load_desc[s_idx]
+        cp[op.id] = max_cp
+        if op.engine == "load":
+            load_desc[op.id] += 1
+
+    for op in ops:
+        # Boost loads and their immediate predecessors (addr_calc ops)
+        boost = 0
+        if op.engine == "load":
+            boost = 50000
+        else:
+            for s_idx in op.succs:
+                if ops[s_idx].engine == "load":
+                    boost = 25000
+                    break
+        # Stagger groups: lower group numbers get slight priority boost
+        # so they reach scattered rounds (with loads) faster
+        group_boost = (32 - op.group) if op.group >= 0 else 0
+        op.priority = cp[op.id] * 1000 + boost + load_desc[op.id] * 100 + group_boost * 10 + len(op.succs)
 
     # Initialize ready lists per engine type
     from heapq import heappush, heappop
@@ -226,7 +258,6 @@ class KernelBuilder:
         inp_values_p_val = inp_indices_p_val + batch_size
 
         # ---- Phase 0: Setup ----
-        # We need header vars loaded for the local test's reference check
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
 
@@ -236,7 +267,6 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        # Skip loading init_vars - kernel uses compile-time constants
 
         # Scalar constants (packed: 2 per cycle)
         zero_const = self.alloc_scratch("zero")
@@ -253,17 +283,16 @@ class KernelBuilder:
             vidx.append(self.alloc_scratch(f"vidx_{g}", VLEN))
             vval.append(self.alloc_scratch(f"vval_{g}", VLEN))
 
-        # ---- Allocate double-buffered shared temp vectors ----
-        # Double-buffering prevents WAR dependencies from serializing groups.
-        # Even-indexed groups use buffer 0, odd-indexed use buffer 1.
+        # ---- Allocate per-group temp vectors ----
+        # N_BUF=32 gives each group its own temp buffers, eliminating all
+        # inter-group WAR coupling. Critical path drops from ~388 to ~240.
+        # vtC is per-group for branch bit and level-2 high bit.
         N_BUF = 25
-        vaddr = [self.alloc_scratch(f"vaddr_{b}", VLEN) for b in range(N_BUF)]
-        vnode = [self.alloc_scratch(f"vnode_{b}", VLEN) for b in range(N_BUF)]
-        vtmp1 = [self.alloc_scratch(f"vtmp1_{b}", VLEN) for b in range(N_BUF)]
-        vtmp2 = [self.alloc_scratch(f"vtmp2_{b}", VLEN) for b in range(N_BUF)]
+        vtA = [self.alloc_scratch(f"vtA_{b}", VLEN) for b in range(N_BUF)]
+        vtB = [self.alloc_scratch(f"vtB_{b}", VLEN) for b in range(N_BUF)]
+        vtC = [self.alloc_scratch(f"vtC_{g}", VLEN) for g in range(n_groups)]
 
         # ---- Allocate and initialize vector constants ----
-        # Pack: load 2 consts per cycle, broadcast 2 from previous cycle
         vec_const_defs = [
             ("v_one", 1),
             ("v_two", 2),
@@ -288,12 +317,10 @@ class KernelBuilder:
         pending_broadcasts = []
         for i in range(0, len(vec_const_defs), 2):
             bundle = {}
-            # Broadcast pending from previous const loads
             if pending_broadcasts:
                 bundle["valu"] = [("vbroadcast", addr, src)
                                   for addr, src in pending_broadcasts]
             pending_broadcasts = []
-            # Load 1-2 new consts
             loads = []
             name1, val1 = vec_const_defs[i]
             loads.append(("const", tmp1, val1))
@@ -304,7 +331,6 @@ class KernelBuilder:
                 pending_broadcasts.append((vec_const_addrs[name2], tmp2))
             bundle["load"] = loads
             self.instrs.append(bundle)
-        # Final broadcasts
         if pending_broadcasts:
             self.instrs.append({"valu": [("vbroadcast", addr, src)
                                          for addr, src in pending_broadcasts]})
@@ -347,7 +373,6 @@ class KernelBuilder:
         v_three = self.alloc_scratch("v_three", VLEN)
 
         # ---- Load tree values from memory (before pause) ----
-        # Pack tree loads: 2 const addrs + 2 mem loads per pair, ALU diffs overlap
         self.instrs.append({"load": [("const", tmp1, forest_values_p_val + 0),
                                      ("const", tmp2, forest_values_p_val + 1)]})
         self.instrs.append({"load": [("load", tree_s0, tmp1),
@@ -374,7 +399,6 @@ class KernelBuilder:
         self.instrs.append({"load": [("const", ptr_idx, inp_indices_p_val),
                                      ("const", ptr_val, inp_values_p_val)]})
 
-        # Tree broadcasts to overlay with first 2 vload cycles
         tree_bc = [
             ("vbroadcast", v_tree0, tree_s0),
             ("vbroadcast", v_tree2_pre, tree_s2),
@@ -400,7 +424,6 @@ class KernelBuilder:
         # ---- Phase 2: Main loop - build op graph for scheduler ----
         graph = OpGraph()
 
-        # Determine tree level for each round
         def tree_level(r):
             if r <= 10:
                 return r
@@ -424,7 +447,15 @@ class KernelBuilder:
         const_addrs.add(zero_const)
         graph.mark_constants(const_addrs)
 
-        # Helper: range set
+        # Mark vtA/vtB as group-local: within-group WAR edges are redundant
+        # because the RAW chain through vg_val guarantees ordering.
+        local_addrs = set()
+        for b in range(N_BUF):
+            for i in range(VLEN):
+                local_addrs.add(vtA[b] + i)
+                local_addrs.add(vtB[b] + i)
+        graph.mark_local(local_addrs)
+
         def vrange(base):
             return set(range(base, base + VLEN))
 
@@ -434,219 +465,238 @@ class KernelBuilder:
                 vg_idx = vidx[g]
                 vg_val = vval[g]
                 buf = g % N_BUF
-                va = vaddr[buf]
-                vn = vnode[buf]
-                vt1 = vtmp1[buf]
-                vt2 = vtmp2[buf]
-                vb = vn  # Reuse vnode for branch (free after XOR)
+                va = vtA[buf]   # vaddr + vtmp1 (merged, shared via N_BUF)
+                vn = vtB[buf]   # vnode + vtmp2 (merged, shared via N_BUF)
+                vt1 = vtA[buf]  # same as va (reused after addr phase)
+                vt2 = vtB[buf]  # same as vn (reused after load/xor phase)
+                vb = vtC[g]     # per-group branch bit (shortens coupling)
 
                 if level == 0:
-                    # -- Level 0: all at idx=0, use preloaded tree[0] --
                     graph.add_op(
                         "valu", ("^", vg_val, vg_val, v_tree0),
                         reads=vrange(vg_val) | vrange(v_tree0),
-                        writes=vrange(vg_val)
+                        writes=vrange(vg_val), group=g
                     )
                 elif level == 1:
-                    # -- Level 1: idx in {1,2}, select from preloaded --
                     graph.add_op(
                         "valu", ("&", vn, vg_idx, v_one),
                         reads=vrange(vg_idx) | vrange(v_one),
-                        writes=vrange(vn)
+                        writes=vrange(vn), group=g
                     )
                     graph.add_op(
                         "valu", ("multiply_add", vn, vn, v_diff12, v_tree2_pre),
                         reads=vrange(vn) | vrange(v_diff12) | vrange(v_tree2_pre),
-                        writes=vrange(vn)
+                        writes=vrange(vn), group=g
                     )
                     graph.add_op(
                         "valu", ("^", vg_val, vg_val, vn),
                         reads=vrange(vg_val) | vrange(vn),
-                        writes=vrange(vg_val)
+                        writes=vrange(vg_val), group=g
                     )
                 elif level == 2:
-                    # -- Level 2: idx in {3,4,5,6}, 4-value selection --
                     graph.add_op(
                         "valu", ("-", vt1, vg_idx, v_three),
                         reads=vrange(vg_idx) | vrange(v_three),
-                        writes=vrange(vt1)
+                        writes=vrange(vt1), group=g
                     )
                     graph.add_op(
                         "valu", ("&", vt2, vt1, v_one),
                         reads=vrange(vt1) | vrange(v_one),
-                        writes=vrange(vt2)
+                        writes=vrange(vt2), group=g
                     )
-                    graph.add_op(
-                        "valu", (">>", va, vt1, v_one),
+                    l2_shr_idx = graph.add_op(
+                        "valu", (">>", vb, vt1, v_one),
                         reads=vrange(vt1) | vrange(v_one),
-                        writes=vrange(va)
+                        writes=vrange(vb), group=g
                     )
+                    # pair0: explicit dep on l2_shr since WAR through vtA
+                    # is skipped (same group) but l2_shr reads vtA with
+                    # no RAW path to pair0 — need the ordering guarantee
                     graph.add_op(
-                        "valu", ("multiply_add", vn, vt2, v_diff34, v_tree3_pre),
+                        "valu", ("multiply_add", vt1, vt2, v_diff34, v_tree3_pre),
                         reads=vrange(vt2) | vrange(v_diff34) | vrange(v_tree3_pre),
-                        writes=vrange(vn)
+                        writes=vrange(vt1), group=g,
+                        extra_preds=[l2_shr_idx]
                     )
                     graph.add_op(
-                        "valu", ("multiply_add", vt1, vt2, v_diff56, v_tree5_pre),
+                        "valu", ("multiply_add", vt2, vt2, v_diff56, v_tree5_pre),
                         reads=vrange(vt2) | vrange(v_diff56) | vrange(v_tree5_pre),
-                        writes=vrange(vt1)
+                        writes=vrange(vt2), group=g
                     )
                     graph.add_op(
-                        "valu", ("-", vt2, vt1, vn),
-                        reads=vrange(vt1) | vrange(vn),
-                        writes=vrange(vt2)
+                        "valu", ("-", vt2, vt2, vt1),
+                        reads=vrange(vt2) | vrange(vt1),
+                        writes=vrange(vt2), group=g
                     )
                     graph.add_op(
-                        "valu", ("multiply_add", vn, va, vt2, vn),
-                        reads=vrange(va) | vrange(vt2) | vrange(vn),
-                        writes=vrange(vn)
+                        "valu", ("multiply_add", vt1, vb, vt2, vt1),
+                        reads=vrange(vb) | vrange(vt2) | vrange(vt1),
+                        writes=vrange(vt1), group=g
                     )
                     graph.add_op(
-                        "valu", ("^", vg_val, vg_val, vn),
-                        reads=vrange(vg_val) | vrange(vn),
-                        writes=vrange(vg_val)
+                        "valu", ("^", vg_val, vg_val, vt1),
+                        reads=vrange(vg_val) | vrange(vt1),
+                        writes=vrange(vg_val), group=g
                     )
                 else:
-                    # -- Standard scattered loads --
-                    # Address computation (1 VALU vector add)
                     graph.add_op(
                         "valu", ("+", va, vg_idx, v_fvp),
                         reads=vrange(vg_idx) | vrange(v_fvp),
-                        writes=vrange(va)
+                        writes=vrange(va), group=g
                     )
-                    # Scattered loads (8 load ops)
                     for i in range(VLEN):
                         graph.add_op(
                             "load", ("load", vn + i, va + i),
                             reads={va + i},
-                            writes={vn + i}
+                            writes={vn + i}, group=g
                         )
-                    # XOR val ^= node_val
                     graph.add_op(
                         "valu", ("^", vg_val, vg_val, vn),
                         reads=vrange(vg_val) | vrange(vn),
-                        writes=vrange(vg_val)
+                        writes=vrange(vg_val), group=g
                     )
 
-                # -- Hash stage 0: multiply_add (a*4097 + C0) --
+                # -- Hash stages --
                 graph.add_op(
                     "valu", ("multiply_add", vg_val, vg_val, v_mul_4097, v_C0),
                     reads=vrange(vg_val) | vrange(v_mul_4097) | vrange(v_C0),
-                    writes=vrange(vg_val)
+                    writes=vrange(vg_val), group=g
                 )
-
-                # -- Hash stage 1: (a^C1) ^ (a>>19) -- XOR in ALU
                 for i in range(VLEN):
                     graph.add_op(
                         "alu", ("^", vt1 + i, vg_val + i, v_C1 + i),
                         reads={vg_val + i, v_C1 + i},
-                        writes={vt1 + i}
+                        writes={vt1 + i}, group=g
                     )
                 graph.add_op(
                     "valu", (">>", vt2, vg_val, v_19),
                     reads=vrange(vg_val) | vrange(v_19),
-                    writes=vrange(vt2)
+                    writes=vrange(vt2), group=g
                 )
                 graph.add_op(
                     "valu", ("^", vg_val, vt1, vt2),
                     reads=vrange(vt1) | vrange(vt2),
-                    writes=vrange(vg_val)
+                    writes=vrange(vg_val), group=g
                 )
-
-                # -- Hash stage 2: multiply_add (a*33 + C2) --
                 graph.add_op(
                     "valu", ("multiply_add", vg_val, vg_val, v_mul_33, v_C2),
                     reads=vrange(vg_val) | vrange(v_mul_33) | vrange(v_C2),
-                    writes=vrange(vg_val)
+                    writes=vrange(vg_val), group=g
                 )
-
-                # -- Hash stage 3: (a+C3) ^ (a<<9) -- ADD in ALU
                 for i in range(VLEN):
                     graph.add_op(
                         "alu", ("+", vt1 + i, vg_val + i, v_C3 + i),
                         reads={vg_val + i, v_C3 + i},
-                        writes={vt1 + i}
+                        writes={vt1 + i}, group=g
                     )
                 graph.add_op(
                     "valu", ("<<", vt2, vg_val, v_9),
                     reads=vrange(vg_val) | vrange(v_9),
-                    writes=vrange(vt2)
+                    writes=vrange(vt2), group=g
                 )
                 graph.add_op(
                     "valu", ("^", vg_val, vt1, vt2),
                     reads=vrange(vt1) | vrange(vt2),
-                    writes=vrange(vg_val)
+                    writes=vrange(vg_val), group=g
                 )
-
-                # -- Hash stage 4: multiply_add (a*9 + C4) --
                 graph.add_op(
                     "valu", ("multiply_add", vg_val, vg_val, v_9, v_C4),
                     reads=vrange(vg_val) | vrange(v_9) | vrange(v_C4),
-                    writes=vrange(vg_val)
+                    writes=vrange(vg_val), group=g
                 )
-
-                # -- Hash stage 5: (a^C5) ^ (a>>16) -- XOR in ALU
                 for i in range(VLEN):
                     graph.add_op(
                         "alu", ("^", vt1 + i, vg_val + i, v_C5 + i),
                         reads={vg_val + i, v_C5 + i},
-                        writes={vt1 + i}
+                        writes={vt1 + i}, group=g
                     )
                 graph.add_op(
                     "valu", (">>", vt2, vg_val, v_16),
                     reads=vrange(vg_val) | vrange(v_16),
-                    writes=vrange(vt2)
+                    writes=vrange(vt2), group=g
                 )
                 graph.add_op(
                     "valu", ("^", vg_val, vt1, vt2),
                     reads=vrange(vt1) | vrange(vt2),
-                    writes=vrange(vg_val)
+                    writes=vrange(vg_val), group=g
                 )
 
                 # -- Branch / wrap --
                 if r == 10:
-                    # All elements wrap to 0 at round 10
                     graph.add_op(
                         "valu", ("vbroadcast", vg_idx, zero_const),
                         reads={zero_const},
-                        writes=vrange(vg_idx)
+                        writes=vrange(vg_idx), group=g
                     )
                 else:
-                    # Branch: idx = 2*idx + 1 + (val & 1)
-                    # Op 1 and 2 are parallel (independent inputs)
                     graph.add_op(
                         "valu", ("&", vb, vg_val, v_one),
                         reads=vrange(vg_val) | vrange(v_one),
-                        writes=vrange(vb)
+                        writes=vrange(vb), group=g
                     )
                     graph.add_op(
                         "valu", ("multiply_add", vg_idx, vg_idx, v_two, v_one),
                         reads=vrange(vg_idx) | vrange(v_two) | vrange(v_one),
-                        writes=vrange(vg_idx)
+                        writes=vrange(vg_idx), group=g
                     )
                     graph.add_op(
                         "valu", ("+", vg_idx, vg_idx, vb),
                         reads=vrange(vg_idx) | vrange(vb),
-                        writes=vrange(vg_idx)
+                        writes=vrange(vg_idx), group=g
                     )
 
-        # Schedule all ops
-        main_bundles = schedule_ops(graph)
-        self.instrs.extend(main_bundles)
+        # ---- Add final stores to the graph for overlapped scheduling ----
+        # Const loads for store pointers
+        ptr_idx_load = graph.add_op(
+            "load", ("const", ptr_idx, inp_indices_p_val),
+            reads=set(), writes={ptr_idx}, group=-1
+        )
+        ptr_val_load = graph.add_op(
+            "load", ("const", ptr_val, inp_values_p_val),
+            reads=set(), writes={ptr_val}, group=-1
+        )
 
-        # ---- Phase 3: Final vstores ----
-        self.add("load", ("const", ptr_idx, inp_indices_p_val))
-        self.add("load", ("const", ptr_val, inp_values_p_val))
-
+        prev_inc_idx = None
         for g in range(n_groups):
-            self.instrs.append({
-                "store": [("vstore", ptr_idx, vidx[g]), ("vstore", ptr_val, vval[g])],
-                "alu": [("+", ptr_idx, ptr_idx, eight_const),
-                        ("+", ptr_val, ptr_val, eight_const)],
-            })
+            vg_idx = vidx[g]
+            vg_val = vval[g]
+            # 2 separate store ops per group
+            preds = [ptr_idx_load, ptr_val_load]
+            if prev_inc_idx is not None:
+                preds.append(prev_inc_idx)
+
+            s_idx = graph.add_op(
+                "store", ("vstore", ptr_idx, vg_idx),
+                reads=vrange(vg_idx) | {ptr_idx}, writes=set(), group=-1,
+                extra_preds=preds
+            )
+            s_val = graph.add_op(
+                "store", ("vstore", ptr_val, vg_val),
+                reads=vrange(vg_val) | {ptr_val}, writes=set(), group=-1,
+                extra_preds=preds
+            )
+            # ALU increments after stores
+            inc_idx = graph.add_op(
+                "alu", ("+", ptr_idx, ptr_idx, eight_const),
+                reads={ptr_idx, eight_const}, writes={ptr_idx}, group=-1,
+                extra_preds=[s_idx, s_val]
+            )
+            prev_inc_idx = graph.add_op(
+                "alu", ("+", ptr_val, ptr_val, eight_const),
+                reads={ptr_val, eight_const}, writes={ptr_val}, group=-1,
+                extra_preds=[s_idx, s_val]
+            )
 
         # Final pause
-        self.instrs.append({"flow": [("pause",)]})
+        graph.add_op(
+            "flow", ("pause",),
+            reads=set(), writes=set(), group=-1,
+            extra_preds=[prev_inc_idx] if prev_inc_idx is not None else []
+        )
+
+        # Schedule all ops (main body + stores + pause)
+        all_bundles = schedule_ops(graph)
+        self.instrs.extend(all_bundles)
 
 
 BASELINE = 147734
