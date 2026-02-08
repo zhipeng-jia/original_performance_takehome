@@ -385,8 +385,10 @@ class KernelBuilder:
         tree_s5 = self.alloc_scratch("tree_s5")
         tree_s6 = self.alloc_scratch("tree_s6")
         v_tree3_pre = self.alloc_scratch("v_tree3_pre", VLEN)
+        # Repurposed: v_tree5_pre holds (tree5 - tree3) for level-2 selection.
         v_tree5_pre = self.alloc_scratch("v_tree5_pre", VLEN)
         v_diff34 = self.alloc_scratch("v_diff34", VLEN)
+        # Repurposed: v_diff56 holds ((tree6 - tree5) - (tree4 - tree3)) for level-2 selection.
         v_diff56 = self.alloc_scratch("v_diff56", VLEN)
         v_three = self.alloc_scratch("v_three", VLEN)
         tree_s7 = self.alloc_scratch("tree_s7")
@@ -438,7 +440,6 @@ class KernelBuilder:
             elif k == 6:
                 bundle.setdefault("valu", []).extend([
                     ("vbroadcast", v_diff12, tree_s1),
-                    ("vbroadcast", v_tree5_pre, tree_s5),
                 ])
             elif k == 8:
                 bundle.setdefault("valu", []).extend([
@@ -447,12 +448,13 @@ class KernelBuilder:
                 ])
             elif k == 10:
                 bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_diff56, tree_s6),
                     ("vbroadcast", v_tree8, tree_s8),
                     ("vbroadcast", v_tree9, tree_s9),
                 ])
             elif k == 12:
                 bundle.setdefault("valu", []).extend([
+                    ("vbroadcast", v_tree5_pre, tree_s5),
+                    ("vbroadcast", v_diff56, tree_s6),
                     ("vbroadcast", v_tree10, tree_s10),
                     ("vbroadcast", v_tree11, tree_s11),
                 ])
@@ -467,7 +469,14 @@ class KernelBuilder:
             elif k == 6:
                 bundle["alu"].append(("-", tree_s4, tree_s4, tree_s3))
             elif k == 8:
+                # diff56 = tree6 - tree5
                 bundle["alu"].append(("-", tree_s6, tree_s6, tree_s5))
+            elif k == 10:
+                # Repurpose (after diff56 is computed above):
+                # - tree_s5 becomes (tree5 - tree3)
+                # - tree_s6 becomes ((tree6 - tree5) - (tree4 - tree3))
+                bundle["alu"].append(("-", tree_s5, tree_s5, tree_s3))
+                bundle["alu"].append(("-", tree_s6, tree_s6, tree_s4))
             # Initialize input pointers via flow (scratch starts at 0).
             if k == 12:
                 bundle["flow"] = [("add_imm", ptr_idx, ptr_idx, inp_indices_p_val)]
@@ -604,7 +613,7 @@ class KernelBuilder:
                         reads=vrange(vt1) | vrange(v_one),
                         writes=vrange(vt2), group=g
                     )
-                    l2_shr_idx = graph.add_op(
+                    graph.add_op(
                         "valu", (">>", vb, vt1, v_one),
                         reads=vrange(vt1) | vrange(v_one),
                         writes=vrange(vb), group=g
@@ -617,11 +626,6 @@ class KernelBuilder:
                     graph.add_op(
                         "valu", ("multiply_add", vt2, vt2, v_diff56, v_tree5_pre),
                         reads=vrange(vt2) | vrange(v_diff56) | vrange(v_tree5_pre),
-                        writes=vrange(vt2), group=g
-                    )
-                    graph.add_op(
-                        "valu", ("-", vt2, vt2, vt1),
-                        reads=vrange(vt2) | vrange(vt1),
                         writes=vrange(vt2), group=g
                     )
                     graph.add_op(
