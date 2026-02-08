@@ -17,6 +17,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+import os
 import random
 import unittest
 
@@ -125,7 +126,13 @@ def schedule_ops(graph):
     if n == 0:
         return []
 
-    # Compute critical path + load descendant count (reverse topo order)
+    # Weights (override via env for local tuning).
+    W_LOAD = int(os.environ.get("SCHED_W_LOAD", "100000"))
+    W_LOAD_DESC = int(os.environ.get("SCHED_W_LOAD_DESC", "10"))
+    W_CP = int(os.environ.get("SCHED_W_CP", "0"))
+    W_GROUP = int(os.environ.get("SCHED_W_GROUP", "1000"))
+
+    # Compute critical path + load-descendant pressure (reverse topo order)
     cp = [0] * n
     load_desc = [0] * n
     for op in reversed(ops):
@@ -139,13 +146,13 @@ def schedule_ops(graph):
             load_desc[op.id] += 1
 
     for op in ops:
-        # Boost loads and their immediate predecessors (addr_calc ops)
-        boost = 100000 if op.engine == "load" else 0
+        # Boost loads and the ops that help keep loads ready.
+        boost = W_LOAD if op.engine == "load" else 0
         # Ops that unlock many downstream loads are often on the throughput-critical spine.
-        boost += load_desc[op.id] * 200
+        boost += load_desc[op.id] * W_LOAD_DESC
         # Stagger groups: lower group numbers get priority boost
-        group_boost = (32 - op.group) * 1000 if op.group >= 0 else 0
-        op.priority = boost + group_boost + cp[op.id] * 10
+        group_boost = (32 - op.group) * W_GROUP if op.group >= 0 else 0
+        op.priority = boost + group_boost + cp[op.id] * W_CP
 
     # Initialize ready lists per engine type
     from heapq import heappush, heappop
@@ -219,6 +226,7 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.last_graph = None
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -832,6 +840,7 @@ class KernelBuilder:
         )
 
         # Schedule all ops (main body + stores + pause)
+        self.last_graph = graph
         all_bundles = schedule_ops(graph)
         self.instrs.extend(all_bundles)
 
