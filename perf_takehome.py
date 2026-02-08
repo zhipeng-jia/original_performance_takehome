@@ -269,6 +269,14 @@ class KernelBuilder:
 
     def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
         n_groups = batch_size // VLEN  # 32
+        # Tradeoff knob: scatter-address formation (idx + forest_values_p) can be
+        # done as 1 VALU op or 8 ALU ops (one per lane). Default picks a mask
+        # that enables the ALU form for a subset of scattered-load levels to
+        # balance ALU vs VALU pressure (empirically best for this kernel).
+        #
+        # Set ADDR_ALU_MASK as a bitmask over tree levels (bit L => use ALU for level L).
+        DEFAULT_ADDR_ALU_MASK = sum(1 << l for l in (5, 6, 7, 8, 9))
+        addr_alu_mask = int(os.environ.get("ADDR_ALU_MASK", str(DEFAULT_ADDR_ALU_MASK)))
 
         # ---- Compile-time known addresses ----
         header_size = 7
@@ -716,11 +724,22 @@ class KernelBuilder:
                         writes=vrange(vg_val), group=g
                     )
                 else:
-                    graph.add_op(
-                        "valu", ("+", va, vg_idx, v_fvp),
-                        reads=vrange(vg_idx) | vrange(v_fvp),
-                        writes=vrange(va), group=g
-                    )
+                    if (addr_alu_mask >> level) & 1:
+                        # Scatter address formation is a common VALU consumer. Move it to ALU:
+                        #   va[i] = vg_idx[i] + forest_values_p
+                        # using the already-broadcast vector constant v_fvp as the scalar source.
+                        for i in range(VLEN):
+                            graph.add_op(
+                                "alu", ("+", va + i, vg_idx + i, v_fvp + i),
+                                reads={vg_idx + i, v_fvp + i},
+                                writes={va + i}, group=g
+                            )
+                    else:
+                        graph.add_op(
+                            "valu", ("+", va, vg_idx, v_fvp),
+                            reads=vrange(vg_idx) | vrange(v_fvp),
+                            writes=vrange(va), group=g
+                        )
                     for i in range(VLEN):
                         graph.add_op(
                             "load", ("load", vn + i, va + i),
