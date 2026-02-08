@@ -426,6 +426,41 @@ class KernelBuilder:
             # Build v_three once (used by level-2): v_three = v_one + v_two
             if k == 0:
                 bundle["valu"] = [("+", v_three, v_one, v_two)]
+            # Pipeline vbroadcasts for the preloaded tree constants into otherwise VALU-idle
+            # prologue cycles. Sources become available 1 cycle after their scalar load / diff.
+            if k == 2:
+                bundle.setdefault("valu", []).append(("vbroadcast", v_tree0, tree_s0))
+            elif k == 4:
+                bundle.setdefault("valu", []).extend([
+                    ("vbroadcast", v_tree2_pre, tree_s2),
+                    ("vbroadcast", v_tree3_pre, tree_s3),
+                ])
+            elif k == 6:
+                bundle.setdefault("valu", []).extend([
+                    ("vbroadcast", v_diff12, tree_s1),
+                    ("vbroadcast", v_tree5_pre, tree_s5),
+                ])
+            elif k == 8:
+                bundle.setdefault("valu", []).extend([
+                    ("vbroadcast", v_diff34, tree_s4),
+                    ("vbroadcast", v_tree7, tree_s7),
+                ])
+            elif k == 10:
+                bundle.setdefault("valu", []).extend([
+                    ("vbroadcast", v_diff56, tree_s6),
+                    ("vbroadcast", v_tree8, tree_s8),
+                    ("vbroadcast", v_tree9, tree_s9),
+                ])
+            elif k == 12:
+                bundle.setdefault("valu", []).extend([
+                    ("vbroadcast", v_tree10, tree_s10),
+                    ("vbroadcast", v_tree11, tree_s11),
+                ])
+            elif k == 14:
+                bundle.setdefault("valu", []).extend([
+                    ("vbroadcast", v_tree12, tree_s12),
+                    ("vbroadcast", v_tree13, tree_s13),
+                ])
             # Scalar diffs become available one cycle after the 2nd operand load.
             if k == 4:
                 bundle["alu"].append(("-", tree_s1, tree_s1, tree_s2))
@@ -441,37 +476,6 @@ class KernelBuilder:
                 # and pause here so external harnesses can treat the next phase as "kernel body".
                 bundle["load"].append(("const", ptr_val, inp_values_p_val))
                 bundle["flow"] = [("pause",)]
-            self.instrs.append(bundle)
-
-        tree_bc = [
-            ("vbroadcast", v_tree0, tree_s0),
-            ("vbroadcast", v_tree2_pre, tree_s2),
-            ("vbroadcast", v_diff12, tree_s1),
-            ("vbroadcast", v_tree3_pre, tree_s3),
-            ("vbroadcast", v_tree5_pre, tree_s5),
-            ("vbroadcast", v_diff34, tree_s4),
-            ("vbroadcast", v_diff56, tree_s6),
-            ("vbroadcast", v_tree7, tree_s7),
-            ("vbroadcast", v_tree8, tree_s8),
-            ("vbroadcast", v_tree9, tree_s9),
-            ("vbroadcast", v_tree10, tree_s10),
-            ("vbroadcast", v_tree11, tree_s11),
-            ("vbroadcast", v_tree12, tree_s12),
-            ("vbroadcast", v_tree13, tree_s13),
-            ("vbroadcast", v_tree14, tree_s14),
-        ]
-        for g in range(n_groups):
-            bundle = {
-                "load": [("vload", vidx[g], ptr_idx), ("vload", vval[g], ptr_val)],
-                "alu": [("+", ptr_idx, ptr_idx, eight_const),
-                        ("+", ptr_val, ptr_val, eight_const)],
-            }
-            if g == 0:
-                bundle["valu"] = tree_bc[:6]
-            elif g == 1:
-                bundle["valu"] = tree_bc[6:12]
-            elif g == 2:
-                bundle["valu"] = tree_bc[12:]
             self.instrs.append(bundle)
 
         # ---- Phase 2: Main loop - build op graph for scheduler ----
@@ -517,6 +521,42 @@ class KernelBuilder:
 
         def vrange(base):
             return set(range(base, base + VLEN))
+
+        # ---- Load input vectors inside the scheduled region (overlap vload with compute) ----
+        # Use ptr_idx/ptr_val and tmp1/tmp2 as ping-pong pointer registers so vload and pointer
+        # bump can be in the same cycle without introducing WAR edges in the dependency graph.
+        for g in range(n_groups):
+            if (g & 1) == 0:
+                ptr_i, ptr_v = ptr_idx, ptr_val
+                ptr_i_next, ptr_v_next = tmp1, tmp2
+            else:
+                ptr_i, ptr_v = tmp1, tmp2
+                ptr_i_next, ptr_v_next = ptr_idx, ptr_val
+
+            graph.add_op(
+                "load", ("vload", vidx[g], ptr_i),
+                reads={ptr_i}, writes=vrange(vidx[g]), group=-1
+            )
+            graph.add_op(
+                "load", ("vload", vval[g], ptr_v),
+                reads={ptr_v}, writes=vrange(vval[g]), group=-1
+            )
+            if g != n_groups - 1:
+                graph.add_op(
+                    "alu", ("+", ptr_i_next, ptr_i, eight_const),
+                    reads={ptr_i, eight_const}, writes={ptr_i_next}, group=-1
+                )
+                graph.add_op(
+                    "alu", ("+", ptr_v_next, ptr_v, eight_const),
+                    reads={ptr_v, eight_const}, writes={ptr_v_next}, group=-1
+                )
+
+        # v_tree14 is loaded in the last scalar tree-load bundle (k==14) so its vbroadcast
+        # cannot be hoisted pre-pause without adding a cycle. Schedule it early here instead.
+        graph.add_op(
+            "valu", ("vbroadcast", v_tree14, tree_s14),
+            reads={tree_s14}, writes=vrange(v_tree14), group=-1
+        )
 
         for r in range(rounds):
             level = tree_level(r)
@@ -800,28 +840,33 @@ class KernelBuilder:
         for g in range(n_groups):
             vg_idx = vidx[g]
             vg_val = vval[g]
-            # 2 separate store ops per group
+            # 2 separate store ops per group; use ping-pong pointers so store and pointer
+            # bump can be co-scheduled (no WAR edge on the pointer register).
+            if (g & 1) == 0:
+                ptr_i, ptr_v = ptr_idx, ptr_val
+                ptr_i_next, ptr_v_next = tmp1, tmp2
+            else:
+                ptr_i, ptr_v = tmp1, tmp2
+                ptr_i_next, ptr_v_next = ptr_idx, ptr_val
+
             s_idx = graph.add_op(
-                "store", ("vstore", ptr_idx, vg_idx),
-                reads=vrange(vg_idx) | {ptr_idx}, writes=set(), group=-1,
+                "store", ("vstore", ptr_i, vg_idx),
+                reads=vrange(vg_idx) | {ptr_i}, writes=set(), group=-1,
                 extra_preds=[ptr_idx_load]
             )
             s_val = graph.add_op(
-                "store", ("vstore", ptr_val, vg_val),
-                reads=vrange(vg_val) | {ptr_val}, writes=set(), group=-1,
+                "store", ("vstore", ptr_v, vg_val),
+                reads=vrange(vg_val) | {ptr_v}, writes=set(), group=-1,
                 extra_preds=[ptr_val_load]
             )
-            # ALU increments for the next group's stores (skip after the last group).
             if g != n_groups - 1:
                 graph.add_op(
-                    "alu", ("+", ptr_idx, ptr_idx, eight_const),
-                    reads={ptr_idx, eight_const}, writes={ptr_idx}, group=-1,
-                    extra_preds=[s_idx]
+                    "alu", ("+", ptr_i_next, ptr_i, eight_const),
+                    reads={ptr_i, eight_const}, writes={ptr_i_next}, group=-1
                 )
                 graph.add_op(
-                    "alu", ("+", ptr_val, ptr_val, eight_const),
-                    reads={ptr_val, eight_const}, writes={ptr_val}, group=-1,
-                    extra_preds=[s_val]
+                    "alu", ("+", ptr_v_next, ptr_v, eight_const),
+                    reads={ptr_v, eight_const}, writes={ptr_v_next}, group=-1
                 )
 
         # Schedule all ops (main body + stores + pause)
