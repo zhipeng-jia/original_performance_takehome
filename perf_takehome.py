@@ -142,16 +142,15 @@ def schedule_ops(graph):
         # Boost loads and their immediate predecessors (addr_calc ops)
         boost = 0
         if op.engine == "load":
-            boost = 50000
+            boost = 100000
         else:
             for s_idx in op.succs:
                 if ops[s_idx].engine == "load":
-                    boost = 25000
+                    boost = 50000
                     break
-        # Stagger groups: lower group numbers get slight priority boost
-        # so they reach scattered rounds (with loads) faster
-        group_boost = (32 - op.group) if op.group >= 0 else 0
-        op.priority = cp[op.id] * 1000 + boost + load_desc[op.id] * 100 + group_boost * 10 + len(op.succs)
+        # Stagger groups: lower group numbers get priority boost
+        group_boost = (32 - op.group) * 1000 if op.group >= 0 else 0
+        op.priority = boost + group_boost + cp[op.id] * 10
 
     # Initialize ready lists per engine type
     from heapq import heappush, heappop
@@ -268,13 +267,8 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
 
-        # Scalar constants (packed: 2 per cycle)
-        zero_const = self.alloc_scratch("zero")
+        # eight_const computed via flow(add_imm) during vec const init
         eight_const = self.alloc_scratch("eight")
-        fvp_const = self.alloc_scratch("fvp_const")
-        self.instrs.append({"load": [("const", zero_const, 0),
-                                     ("const", eight_const, 8)]})
-        self.instrs.append({"load": [("const", fvp_const, forest_values_p_val)]})
 
         # ---- Allocate persistent vectors (32 groups x 2 vectors x 8 elements) ----
         vidx = []
@@ -285,9 +279,9 @@ class KernelBuilder:
 
         # ---- Allocate per-group temp vectors ----
         # N_BUF=32 gives each group its own temp buffers, eliminating all
-        # inter-group WAR coupling. Critical path drops from ~388 to ~240.
+        # inter-group WAR coupling.
         # vtC is per-group for branch bit and level-2 high bit.
-        N_BUF = 25
+        N_BUF = 32
         vtA = [self.alloc_scratch(f"vtA_{b}", VLEN) for b in range(N_BUF)]
         vtB = [self.alloc_scratch(f"vtB_{b}", VLEN) for b in range(N_BUF)]
         vtC = [self.alloc_scratch(f"vtC_{g}", VLEN) for g in range(n_groups)]
@@ -320,6 +314,9 @@ class KernelBuilder:
             if pending_broadcasts:
                 bundle["valu"] = [("vbroadcast", addr, src)
                                   for addr, src in pending_broadcasts]
+                # First broadcast cycle: compute eight_const = 0 + 8
+                if i == 2:
+                    bundle["flow"] = [("add_imm", eight_const, eight_const, 8)]
             pending_broadcasts = []
             loads = []
             name1, val1 = vec_const_defs[i]
@@ -332,8 +329,12 @@ class KernelBuilder:
             bundle["load"] = loads
             self.instrs.append(bundle)
         if pending_broadcasts:
-            self.instrs.append({"valu": [("vbroadcast", addr, src)
-                                         for addr, src in pending_broadcasts]})
+            # Merge trailing broadcasts with first tree address const loads
+            self.instrs.append({
+                "valu": [("vbroadcast", addr, src) for addr, src in pending_broadcasts],
+                "load": [("const", tmp1, forest_values_p_val + 0),
+                         ("const", tmp2, forest_values_p_val + 1)]
+            })
 
         v_one = vec_const_addrs["v_one"]
         v_two = vec_const_addrs["v_two"]
@@ -372,32 +373,30 @@ class KernelBuilder:
         v_diff56 = self.alloc_scratch("v_diff56", VLEN)
         v_three = self.alloc_scratch("v_three", VLEN)
 
-        # ---- Load tree values from memory (before pause) ----
-        self.instrs.append({"load": [("const", tmp1, forest_values_p_val + 0),
-                                     ("const", tmp2, forest_values_p_val + 1)]})
+        # ---- Load tree values from memory (interleaved pipeline) ----
+        # First tree const loads merged with trailing vec broadcasts above.
+        # Interleave: load(tree, tmpX) + const(tmpX, next_addr) in same cycle.
         self.instrs.append({"load": [("load", tree_s0, tmp1),
-                                     ("load", tree_s1, tmp2)]})
-        self.instrs.append({"load": [("const", tmp1, forest_values_p_val + 2),
+                                     ("const", tmp1, forest_values_p_val + 2)]})
+        self.instrs.append({"load": [("load", tree_s1, tmp2),
                                      ("const", tmp2, forest_values_p_val + 3)]})
         self.instrs.append({"load": [("load", tree_s2, tmp1),
-                                     ("load", tree_s3, tmp2)]})
-        self.instrs.append({"load": [("const", tmp1, forest_values_p_val + 4),
+                                     ("const", tmp1, forest_values_p_val + 4)]})
+        self.instrs.append({"load": [("load", tree_s3, tmp2),
                                      ("const", tmp2, forest_values_p_val + 5)],
                             "alu": [("-", diff12_s, tree_s1, tree_s2)]})
         self.instrs.append({"load": [("load", tree_s4, tmp1),
-                                     ("load", tree_s5, tmp2)]})
-        self.instrs.append({"load": [("const", tmp1, forest_values_p_val + 6),
+                                     ("const", tmp1, forest_values_p_val + 6)]})
+        self.instrs.append({"load": [("load", tree_s5, tmp2),
                                      ("const", tmp2, 3)],
                             "alu": [("-", diff34_s, tree_s4, tree_s3)]})
-        self.instrs.append({"load": [("load", tree_s6, tmp1)]})
-        self.instrs.append({"alu": [("-", diff56_s, tree_s6, tree_s5)]})
+        self.instrs.append({"load": [("load", tree_s6, tmp1),
+                                     ("const", ptr_idx, inp_indices_p_val)]})
 
-        # ---- Pause (matches first yield in reference_kernel2) ----
-        self.add("flow", ("pause",))
-
-        # ---- Phase 1: Initial vloads with tree broadcasts overlapped ----
-        self.instrs.append({"load": [("const", ptr_idx, inp_indices_p_val),
-                                     ("const", ptr_val, inp_values_p_val)]})
+        # ---- Pause + diff56 + ptr_val (all merged into one cycle) ----
+        self.instrs.append({"flow": [("pause",)],
+                            "alu": [("-", diff56_s, tree_s6, tree_s5)],
+                            "load": [("const", ptr_val, inp_values_p_val)]})
 
         tree_bc = [
             ("vbroadcast", v_tree0, tree_s0),
@@ -443,18 +442,7 @@ class KernelBuilder:
         for base, length in const_addr_ranges:
             for i in range(length):
                 const_addrs.add(base + i)
-        const_addrs.add(fvp_const)
-        const_addrs.add(zero_const)
         graph.mark_constants(const_addrs)
-
-        # Mark vtA/vtB as group-local: within-group WAR edges are redundant
-        # because the RAW chain through vg_val guarantees ordering.
-        local_addrs = set()
-        for b in range(N_BUF):
-            for i in range(VLEN):
-                local_addrs.add(vtA[b] + i)
-                local_addrs.add(vtB[b] + i)
-        graph.mark_local(local_addrs)
 
         def vrange(base):
             return set(range(base, base + VLEN))
@@ -509,14 +497,10 @@ class KernelBuilder:
                         reads=vrange(vt1) | vrange(v_one),
                         writes=vrange(vb), group=g
                     )
-                    # pair0: explicit dep on l2_shr since WAR through vtA
-                    # is skipped (same group) but l2_shr reads vtA with
-                    # no RAW path to pair0 — need the ordering guarantee
                     graph.add_op(
                         "valu", ("multiply_add", vt1, vt2, v_diff34, v_tree3_pre),
                         reads=vrange(vt2) | vrange(v_diff34) | vrange(v_tree3_pre),
-                        writes=vrange(vt1), group=g,
-                        extra_preds=[l2_shr_idx]
+                        writes=vrange(vt1), group=g
                     )
                     graph.add_op(
                         "valu", ("multiply_add", vt2, vt2, v_diff56, v_tree5_pre),
@@ -623,9 +607,10 @@ class KernelBuilder:
 
                 # -- Branch / wrap --
                 if r == 10:
+                    # XOR with self = 0 (eliminates zero_const dependency)
                     graph.add_op(
-                        "valu", ("vbroadcast", vg_idx, zero_const),
-                        reads={zero_const},
+                        "valu", ("^", vg_idx, vg_idx, vg_idx),
+                        reads=vrange(vg_idx),
                         writes=vrange(vg_idx), group=g
                     )
                 else:
