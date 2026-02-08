@@ -128,8 +128,16 @@ def schedule_ops(graph):
 
     # Weights (override via env for local tuning).
     W_LOAD = int(os.environ.get("SCHED_W_LOAD", "100000"))
-    W_LOAD_DESC = int(os.environ.get("SCHED_W_LOAD_DESC", "10"))
-    W_GROUP_DEFAULT = int(os.environ.get("SCHED_W_GROUP", "200000"))
+    W_PRELOAD = int(os.environ.get("SCHED_W_PRELOAD", "50000"))
+    W_LOAD_DESC = int(os.environ.get("SCHED_W_LOAD_DESC", "0"))
+    W_CP = int(os.environ.get("SCHED_W_CP", "10"))
+    W_GROUP_DEFAULT = int(os.environ.get("SCHED_W_GROUP", "0"))
+
+    # Critical-path length (reverse topo order; ops are appended in topo order).
+    cp_len = [0] * n
+    for op in reversed(ops):
+        if op.succs:
+            cp_len[op.id] = 1 + max(cp_len[s] for s in op.succs)
 
     # Compute load-descendant pressure (reverse topo order)
     load_desc = [0] * n
@@ -140,8 +148,15 @@ def schedule_ops(graph):
             load_desc[op.id] += 1
 
     for op in ops:
-        # Boost loads and the ops that help keep loads ready.
-        boost = W_LOAD if op.engine == "load" else 0
+        boost = 0
+        # Boost loads and the ops that feed loads (addr_calc-style predecessors).
+        if op.engine == "load":
+            boost += W_LOAD
+        else:
+            for s_idx in op.succs:
+                if ops[s_idx].engine == "load":
+                    boost += W_PRELOAD
+                    break
         # Ops that unlock many downstream loads are often on the throughput-critical spine.
         boost += load_desc[op.id] * W_LOAD_DESC
         # Stagger groups: lower group numbers get priority boost.
@@ -149,7 +164,7 @@ def schedule_ops(graph):
             group_boost = (32 - op.group) * W_GROUP_DEFAULT
         else:
             group_boost = 0
-        op.priority = boost + group_boost
+        op.priority = boost + group_boost + cp_len[op.id] * W_CP
 
     # Initialize ready lists per engine type
     from heapq import heappush, heappop
@@ -359,15 +374,16 @@ class KernelBuilder:
         v_tree0 = self.alloc_scratch("v_tree0", VLEN)
         tree_s1 = self.alloc_scratch("tree_s1")
         tree_s2 = self.alloc_scratch("tree_s2")
-        diff12_s = self.alloc_scratch("diff12_s")
+        # Reuse a few tree scalar slots to hold scalar diffs (saves 3 scratch words):
+        # - tree_s1 will hold (tree1 - tree2)
+        # - tree_s4 will hold (tree4 - tree3)
+        # - tree_s6 will hold (tree6 - tree5)
         v_tree2_pre = self.alloc_scratch("v_tree2_pre", VLEN)
         v_diff12 = self.alloc_scratch("v_diff12", VLEN)
         tree_s3 = self.alloc_scratch("tree_s3")
         tree_s4 = self.alloc_scratch("tree_s4")
         tree_s5 = self.alloc_scratch("tree_s5")
         tree_s6 = self.alloc_scratch("tree_s6")
-        diff34_s = self.alloc_scratch("diff34_s")
-        diff56_s = self.alloc_scratch("diff56_s")
         v_tree3_pre = self.alloc_scratch("v_tree3_pre", VLEN)
         v_tree5_pre = self.alloc_scratch("v_tree5_pre", VLEN)
         v_diff34 = self.alloc_scratch("v_diff34", VLEN)
@@ -389,7 +405,9 @@ class KernelBuilder:
         v_tree12 = self.alloc_scratch("v_tree12", VLEN)
         v_tree13 = self.alloc_scratch("v_tree13", VLEN)
         v_tree14 = self.alloc_scratch("v_tree14", VLEN)
-        v_l3_cond = self.alloc_scratch("v_l3_cond", VLEN)
+        # Stripe level-3 condition vectors across groups to reduce inter-group coupling.
+        v_l3_cond0 = self.alloc_scratch("v_l3_cond0", VLEN)
+        v_l3_cond1 = self.alloc_scratch("v_l3_cond1", VLEN)
 
         # ---- Load tree values from memory (pipelined pointers; no per-load consts) ----
         # tmp1/tmp2 already hold forest_values_p_val+0/+1 from the trailing vec-const bundle.
@@ -410,11 +428,11 @@ class KernelBuilder:
                 bundle["valu"] = [("+", v_three, v_one, v_two)]
             # Scalar diffs become available one cycle after the 2nd operand load.
             if k == 4:
-                bundle["alu"].append(("-", diff12_s, tree_s1, tree_s2))
+                bundle["alu"].append(("-", tree_s1, tree_s1, tree_s2))
             elif k == 6:
-                bundle["alu"].append(("-", diff34_s, tree_s4, tree_s3))
+                bundle["alu"].append(("-", tree_s4, tree_s4, tree_s3))
             elif k == 8:
-                bundle["alu"].append(("-", diff56_s, tree_s6, tree_s5))
+                bundle["alu"].append(("-", tree_s6, tree_s6, tree_s5))
             # Initialize input pointers via flow (scratch starts at 0).
             if k == 12:
                 bundle["flow"] = [("add_imm", ptr_idx, ptr_idx, inp_indices_p_val)]
@@ -428,11 +446,11 @@ class KernelBuilder:
         tree_bc = [
             ("vbroadcast", v_tree0, tree_s0),
             ("vbroadcast", v_tree2_pre, tree_s2),
-            ("vbroadcast", v_diff12, diff12_s),
+            ("vbroadcast", v_diff12, tree_s1),
             ("vbroadcast", v_tree3_pre, tree_s3),
             ("vbroadcast", v_tree5_pre, tree_s5),
-            ("vbroadcast", v_diff34, diff34_s),
-            ("vbroadcast", v_diff56, diff56_s),
+            ("vbroadcast", v_diff34, tree_s4),
+            ("vbroadcast", v_diff56, tree_s6),
             ("vbroadcast", v_tree7, tree_s7),
             ("vbroadcast", v_tree8, tree_s8),
             ("vbroadcast", v_tree9, tree_s9),
@@ -511,6 +529,7 @@ class KernelBuilder:
                 vt1 = vtA[buf]  # same as va (reused after addr phase)
                 vt2 = vtB[buf]  # same as vn (reused after load/xor phase)
                 vb = vtC[g]     # per-group branch bit (shortens coupling)
+                v_l3_cond = v_l3_cond0 if (g & 1) == 0 else v_l3_cond1
 
                 if level == 0:
                     graph.add_op(
@@ -577,7 +596,7 @@ class KernelBuilder:
                     )
                 elif level == 3:
                     # Preload level-3 nodes (7..14) into scratch and select per lane.
-                    # Use a shared condition vector (v_l3_cond) to avoid needing a 4th temp.
+                    # Use a striped shared condition vector (v_l3_cond{0,1}) to avoid needing a 4th temp.
                     # Offset bits come from w = idx + 1 (w in 8..15): bit0/1/2 == offset bits.
                     graph.add_op(
                         "valu", ("+", va, vg_idx, v_one),
@@ -792,17 +811,18 @@ class KernelBuilder:
                 reads=vrange(vg_val) | {ptr_val}, writes=set(), group=-1,
                 extra_preds=[ptr_val_load]
             )
-            # ALU increments after stores
-            inc_idx = graph.add_op(
-                "alu", ("+", ptr_idx, ptr_idx, eight_const),
-                reads={ptr_idx, eight_const}, writes={ptr_idx}, group=-1,
-                extra_preds=[s_idx]
-            )
-            inc_val = graph.add_op(
-                "alu", ("+", ptr_val, ptr_val, eight_const),
-                reads={ptr_val, eight_const}, writes={ptr_val}, group=-1,
-                extra_preds=[s_val]
-            )
+            # ALU increments for the next group's stores (skip after the last group).
+            if g != n_groups - 1:
+                graph.add_op(
+                    "alu", ("+", ptr_idx, ptr_idx, eight_const),
+                    reads={ptr_idx, eight_const}, writes={ptr_idx}, group=-1,
+                    extra_preds=[s_idx]
+                )
+                graph.add_op(
+                    "alu", ("+", ptr_val, ptr_val, eight_const),
+                    reads={ptr_val, eight_const}, writes={ptr_val}, group=-1,
+                    extra_preds=[s_val]
+                )
 
         # Schedule all ops (main body + stores + pause)
         self.last_graph = graph
