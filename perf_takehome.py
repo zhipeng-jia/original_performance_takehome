@@ -578,7 +578,6 @@ class KernelBuilder:
                 vt1 = vtA[buf]  # same as va (reused after addr phase)
                 vt2 = vtB[buf]  # same as vn (reused after load/xor phase)
                 vb = vtC[g]     # per-group branch bit (shortens coupling)
-                v_l3_cond = v_l3_cond0 if (g & 1) == 0 else v_l3_cond1
 
                 if level == 0:
                     graph.add_op(
@@ -640,80 +639,78 @@ class KernelBuilder:
                     )
                 elif level == 3:
                     # Preload level-3 nodes (7..14) into scratch and select per lane.
-                    # Use a striped shared condition vector (v_l3_cond{0,1}) to avoid needing a 4th temp.
-                    # Offset bits come from w = idx + 1 (w in 8..15): bit0/1/2 == offset bits.
+                    # Offset bits come from w = idx + 1 (w in 8..15): bits 0/1/2 == offset bits.
+                    # Keep b2 in the per-group vb temp so we don't need to recompute w later.
+                    # Note: v_l3_cond0/v_l3_cond1 are shared across all groups here; the flow engine
+                    # (1 slot/cycle) already forces global serialization of vselects, so the added
+                    # coupling is typically tolerable and saves VALU ops.
                     graph.add_op(
                         "valu", ("+", va, vg_idx, v_one),
                         reads=vrange(vg_idx) | vrange(v_one),
                         writes=vrange(va), group=g
                     )
                     graph.add_op(
-                        "valu", ("&", vb, va, v_one),
+                        "valu", ("&", v_l3_cond0, va, v_one),
+                        reads=vrange(va) | vrange(v_one),
+                        writes=vrange(v_l3_cond0), group=g
+                    )
+                    # b1 = w & 2  (nonzero => true for vselect)
+                    graph.add_op(
+                        "valu", ("&", v_l3_cond1, va, v_two),
+                        reads=vrange(va) | vrange(v_two),
+                        writes=vrange(v_l3_cond1), group=g
+                    )
+                    # b2 = ((w >> 1) & 2)  (nonzero => true for vselect)
+                    graph.add_op(
+                        "valu", (">>", vb, va, v_one),
                         reads=vrange(va) | vrange(v_one),
                         writes=vrange(vb), group=g
                     )
-
-                    # b1 = w & 2  (nonzero => true for vselect)
                     graph.add_op(
-                        "valu", ("&", v_l3_cond, va, v_two),
-                        reads=vrange(va) | vrange(v_two),
-                        writes=vrange(v_l3_cond), group=g
+                        "valu", ("&", vb, vb, v_two),
+                        reads=vrange(vb) | vrange(v_two),
+                        writes=vrange(vb), group=g
                     )
 
                     # s0/s1 -> t0 (lower quad)
                     graph.add_op(
-                        "flow", ("vselect", vn, vb, v_tree8, v_tree7),
-                        reads=vrange(vb) | vrange(v_tree8) | vrange(v_tree7),
+                        "flow", ("vselect", vn, v_l3_cond0, v_tree8, v_tree7),
+                        reads=vrange(v_l3_cond0) | vrange(v_tree8) | vrange(v_tree7),
                         writes=vrange(vn), group=g
                     )
                     graph.add_op(
-                        "flow", ("vselect", va, vb, v_tree10, v_tree9),
-                        reads=vrange(vb) | vrange(v_tree10) | vrange(v_tree9),
+                        "flow", ("vselect", va, v_l3_cond0, v_tree10, v_tree9),
+                        reads=vrange(v_l3_cond0) | vrange(v_tree10) | vrange(v_tree9),
                         writes=vrange(va), group=g
                     )
                     graph.add_op(
-                        "flow", ("vselect", vn, v_l3_cond, va, vn),
-                        reads=vrange(v_l3_cond) | vrange(va) | vrange(vn),
+                        "flow", ("vselect", vn, v_l3_cond1, va, vn),
+                        reads=vrange(v_l3_cond1) | vrange(va) | vrange(vn),
                         writes=vrange(vn), group=g
                     )
 
                     # s2/s3 -> t1 (upper quad)
                     graph.add_op(
-                        "flow", ("vselect", va, vb, v_tree12, v_tree11),
-                        reads=vrange(vb) | vrange(v_tree12) | vrange(v_tree11),
+                        "flow", ("vselect", va, v_l3_cond0, v_tree12, v_tree11),
+                        reads=vrange(v_l3_cond0) | vrange(v_tree12) | vrange(v_tree11),
                         writes=vrange(va), group=g
                     )
                     graph.add_op(
-                        "flow", ("vselect", vb, vb, v_tree14, v_tree13),
-                        reads=vrange(vb) | vrange(v_tree14) | vrange(v_tree13),
-                        writes=vrange(vb), group=g
+                        # Reuse v_l3_cond0 as temp after its last use as the b0 condition.
+                        # Cond and dest aliasing is safe: reads occur before writes within a cycle.
+                        "flow", ("vselect", v_l3_cond0, v_l3_cond0, v_tree14, v_tree13),
+                        reads=vrange(v_l3_cond0) | vrange(v_tree14) | vrange(v_tree13),
+                        writes=vrange(v_l3_cond0), group=g
                     )
-
                     graph.add_op(
-                        "flow", ("vselect", va, v_l3_cond, vb, va),
-                        reads=vrange(v_l3_cond) | vrange(vb) | vrange(va),
+                        "flow", ("vselect", va, v_l3_cond1, v_l3_cond0, va),
+                        reads=vrange(v_l3_cond1) | vrange(v_l3_cond0) | vrange(va),
                         writes=vrange(va), group=g
                     )
 
-                    # b2 = ((idx + 1) >> 2) & 1
                     graph.add_op(
-                        "valu", ("+", v_l3_cond, vg_idx, v_one),
-                        reads=vrange(vg_idx) | vrange(v_one),
-                        writes=vrange(v_l3_cond), group=g
-                    )
-                    graph.add_op(
-                        "valu", (">>", v_l3_cond, v_l3_cond, v_two),
-                        reads=vrange(v_l3_cond) | vrange(v_two),
-                        writes=vrange(v_l3_cond), group=g
-                    )
-                    graph.add_op(
-                        "valu", ("&", v_l3_cond, v_l3_cond, v_one),
-                        reads=vrange(v_l3_cond) | vrange(v_one),
-                        writes=vrange(v_l3_cond), group=g
-                    )
-                    graph.add_op(
-                        "flow", ("vselect", vn, v_l3_cond, va, vn),
-                        reads=vrange(v_l3_cond) | vrange(va) | vrange(vn),
+                        "flow", ("vselect", vn, vb, va, vn),
+                        reads=vrange(vb) | vrange(va) | vrange(vn),
                         writes=vrange(vn), group=g
                     )
 
