@@ -278,6 +278,7 @@ class KernelBuilder:
             ("v_C4", HASH_STAGES[4][1]),
             ("v_C5", HASH_STAGES[5][1]),
             ("v_16", HASH_STAGES[5][4]),
+            ("v_fvp", forest_values_p_val),
         ]
         vec_const_addrs = {}
         for name, _ in vec_const_defs:
@@ -321,6 +322,7 @@ class KernelBuilder:
         v_C4 = vec_const_addrs["v_C4"]
         v_C5 = vec_const_addrs["v_C5"]
         v_16 = vec_const_addrs["v_16"]
+        v_fvp = vec_const_addrs["v_fvp"]
 
         # ---- Allocate tree scratch (before pause, loads happen pre-pause) ----
         ptr_idx = self.alloc_scratch("ptr_idx")
@@ -409,7 +411,7 @@ class KernelBuilder:
             (v_one, VLEN), (v_two, VLEN),
             (v_mul_4097, VLEN), (v_C0, VLEN), (v_C1, VLEN), (v_19, VLEN),
             (v_mul_33, VLEN), (v_C2, VLEN), (v_C3, VLEN), (v_9, VLEN),
-            (v_C4, VLEN), (v_C5, VLEN), (v_16, VLEN),
+            (v_C4, VLEN), (v_C5, VLEN), (v_16, VLEN), (v_fvp, VLEN),
             (v_tree0, VLEN), (v_tree2_pre, VLEN), (v_diff12, VLEN),
             (v_tree3_pre, VLEN), (v_tree5_pre, VLEN),
             (v_diff34, VLEN), (v_diff56, VLEN), (v_three, VLEN),
@@ -506,13 +508,12 @@ class KernelBuilder:
                     )
                 else:
                     # -- Standard scattered loads --
-                    # Address computation (8 ALU ops)
-                    for i in range(VLEN):
-                        graph.add_op(
-                            "alu", ("+", va + i, fvp_const, vg_idx + i),
-                            reads={fvp_const, vg_idx + i},
-                            writes={va + i}
-                        )
+                    # Address computation (1 VALU vector add)
+                    graph.add_op(
+                        "valu", ("+", va, vg_idx, v_fvp),
+                        reads=vrange(vg_idx) | vrange(v_fvp),
+                        writes=vrange(va)
+                    )
                     # Scattered loads (8 load ops)
                     for i in range(VLEN):
                         graph.add_op(
