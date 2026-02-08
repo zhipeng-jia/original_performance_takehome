@@ -275,7 +275,9 @@ class KernelBuilder:
         # balance ALU vs VALU pressure (empirically best for this kernel).
         #
         # Set ADDR_ALU_MASK as a bitmask over tree levels (bit L => use ALU for level L).
-        DEFAULT_ADDR_ALU_MASK = sum(1 << l for l in (5, 6, 7, 8, 9))
+        # Tuned default for this kernel shape: using ALU on levels 4–7 tends to
+        # smooth ALU/VALU pressure peaks and improves schedule quality.
+        DEFAULT_ADDR_ALU_MASK = sum(1 << l for l in (4, 5, 6, 7))
         addr_alu_mask = int(os.environ.get("ADDR_ALU_MASK", str(DEFAULT_ADDR_ALU_MASK)))
 
         # ---- Compile-time known addresses ----
@@ -387,18 +389,16 @@ class KernelBuilder:
         # - tree_s1 will hold (tree1 - tree2)
         # - tree_s4 will hold (tree4 - tree3)
         # - tree_s6 will hold (tree6 - tree5)
-        v_tree2_pre = self.alloc_scratch("v_tree2_pre", VLEN)
-        v_diff12 = self.alloc_scratch("v_diff12", VLEN)
+        v_tree2 = self.alloc_scratch("v_tree2", VLEN)
+        v_tree1 = self.alloc_scratch("v_tree1", VLEN)
         tree_s3 = self.alloc_scratch("tree_s3")
         tree_s4 = self.alloc_scratch("tree_s4")
         tree_s5 = self.alloc_scratch("tree_s5")
         tree_s6 = self.alloc_scratch("tree_s6")
-        v_tree3_pre = self.alloc_scratch("v_tree3_pre", VLEN)
-        # Repurposed: v_tree5_pre holds (tree5 - tree3) for level-2 selection.
-        v_tree5_pre = self.alloc_scratch("v_tree5_pre", VLEN)
-        v_diff34 = self.alloc_scratch("v_diff34", VLEN)
-        # Repurposed: v_diff56 holds ((tree6 - tree5) - (tree4 - tree3)) for level-2 selection.
-        v_diff56 = self.alloc_scratch("v_diff56", VLEN)
+        v_tree3 = self.alloc_scratch("v_tree3", VLEN)
+        v_tree5 = self.alloc_scratch("v_tree5", VLEN)
+        v_tree4 = self.alloc_scratch("v_tree4", VLEN)
+        v_tree6 = self.alloc_scratch("v_tree6", VLEN)
         v_three = self.alloc_scratch("v_three", VLEN)
         tree_s7 = self.alloc_scratch("tree_s7")
         tree_s8 = self.alloc_scratch("tree_s8")
@@ -441,27 +441,27 @@ class KernelBuilder:
             # prologue cycles. Sources become available 1 cycle after their scalar load / diff.
             if k == 4:
                 bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_tree2_pre, tree_s2),
-                    ("vbroadcast", v_tree3_pre, tree_s3),
+                    ("vbroadcast", v_tree1, tree_s1),
+                    ("vbroadcast", v_tree2, tree_s2),
+                    ("vbroadcast", v_tree3, tree_s3),
                 ])
             elif k == 6:
                 bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_diff12, tree_s1),
+                    ("vbroadcast", v_tree4, tree_s4),
                 ])
             elif k == 8:
                 bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_diff34, tree_s4),
+                    ("vbroadcast", v_tree6, tree_s6),
                     ("vbroadcast", v_tree7, tree_s7),
                 ])
             elif k == 10:
                 bundle.setdefault("valu", []).extend([
+                    ("vbroadcast", v_tree5, tree_s5),
                     ("vbroadcast", v_tree8, tree_s8),
                     ("vbroadcast", v_tree9, tree_s9),
                 ])
             elif k == 12:
                 bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_tree5_pre, tree_s5),
-                    ("vbroadcast", v_diff56, tree_s6),
                     ("vbroadcast", v_tree10, tree_s10),
                     ("vbroadcast", v_tree11, tree_s11),
                 ])
@@ -522,9 +522,9 @@ class KernelBuilder:
             (v_mul_4097, VLEN), (v_C0, VLEN), (v_19, VLEN),
             (v_mul_33, VLEN), (v_C2, VLEN), (v_9, VLEN),
             (v_C4, VLEN), (v_16, VLEN), (v_fvp, VLEN),
-            (v_tree2_pre, VLEN), (v_diff12, VLEN),
-            (v_tree3_pre, VLEN), (v_tree5_pre, VLEN),
-            (v_diff34, VLEN), (v_diff56, VLEN), (v_three, VLEN),
+            (v_tree1, VLEN), (v_tree2, VLEN), (v_tree3, VLEN),
+            (v_tree4, VLEN), (v_tree5, VLEN), (v_tree6, VLEN),
+            (v_three, VLEN),
             (v_tree7, VLEN), (v_tree8, VLEN), (v_tree9, VLEN), (v_tree10, VLEN),
             (v_tree11, VLEN), (v_tree12, VLEN), (v_tree13, VLEN), (v_tree14, VLEN),
         ]
@@ -601,8 +601,8 @@ class KernelBuilder:
                         writes=vrange(vn), group=g
                     )
                     graph.add_op(
-                        "valu", ("multiply_add", vn, vn, v_diff12, v_tree2_pre),
-                        reads=vrange(vn) | vrange(v_diff12) | vrange(v_tree2_pre),
+                        "flow", ("vselect", vn, vn, v_tree1, v_tree2),
+                        reads=vrange(vn) | vrange(v_tree1) | vrange(v_tree2),
                         writes=vrange(vn), group=g
                     )
                     graph.add_op(
@@ -617,27 +617,27 @@ class KernelBuilder:
                         writes=vrange(vt1), group=g
                     )
                     graph.add_op(
-                        "valu", ("&", vt2, vt1, v_one),
+                        "valu", ("&", vt2, vt1, v_one),  # cond0: offset bit0
                         reads=vrange(vt1) | vrange(v_one),
                         writes=vrange(vt2), group=g
                     )
                     graph.add_op(
-                        "valu", (">>", vb, vt1, v_one),
-                        reads=vrange(vt1) | vrange(v_one),
+                        "valu", ("&", vb, vt1, v_two),  # cond1: offset bit1 (nonzero => upper pair)
+                        reads=vrange(vt1) | vrange(v_two),
                         writes=vrange(vb), group=g
                     )
                     graph.add_op(
-                        "valu", ("multiply_add", vt1, vt2, v_diff34, v_tree3_pre),
-                        reads=vrange(vt2) | vrange(v_diff34) | vrange(v_tree3_pre),
+                        "flow", ("vselect", vt1, vt2, v_tree4, v_tree3),
+                        reads=vrange(vt2) | vrange(v_tree4) | vrange(v_tree3),
                         writes=vrange(vt1), group=g
                     )
                     graph.add_op(
-                        "valu", ("multiply_add", vt2, vt2, v_diff56, v_tree5_pre),
-                        reads=vrange(vt2) | vrange(v_diff56) | vrange(v_tree5_pre),
+                        "flow", ("vselect", vt2, vt2, v_tree6, v_tree5),
+                        reads=vrange(vt2) | vrange(v_tree6) | vrange(v_tree5),
                         writes=vrange(vt2), group=g
                     )
                     graph.add_op(
-                        "valu", ("multiply_add", vt1, vb, vt2, vt1),
+                        "flow", ("vselect", vt1, vb, vt2, vt1),
                         reads=vrange(vb) | vrange(vt2) | vrange(vt1),
                         writes=vrange(vt1), group=g
                     )
