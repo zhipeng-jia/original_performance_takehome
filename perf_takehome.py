@@ -43,13 +43,15 @@ from problem import (
 # ---------------------------------------------------------------------------
 
 class Op:
-    __slots__ = ['engine', 'slot', 'id', 'succs', 'pred_count', 'priority', 'group']
+    __slots__ = ['engine', 'slot', 'id', 'succs', 'pred_count', 'zero_succs', 'zero_pred_count', 'priority', 'group']
     def __init__(self, engine, slot, op_id, group=-1):
         self.engine = engine
         self.slot = slot
         self.id = op_id
         self.succs = []
         self.pred_count = 0
+        self.zero_succs = []
+        self.zero_pred_count = 0
         self.priority = 0
         self.group = group
 
@@ -62,6 +64,7 @@ class OpGraph:
         self.readers_since_write = {}   # addr -> [op_index]
         self.const_addrs = set()
         self.local_addrs = set()        # addrs where within-group WAR is skipped
+        self.zero_war_addrs = set()     # addrs where WAR is latency-0 (same-cycle allowed)
 
     def mark_constants(self, addrs):
         """Mark addresses as read-only constants (skip WAR tracking for them)."""
@@ -73,11 +76,16 @@ class OpGraph:
         making WAR edges redundant. Between groups, WAR is still needed."""
         self.local_addrs.update(addrs)
 
+    def mark_zero_war(self, addrs):
+        """Mark addresses where WAR edges are latency-0 (writer may co-issue with readers)."""
+        self.zero_war_addrs.update(addrs)
+
     def add_op(self, engine, slot, reads, writes, group=-1, extra_preds=None):
         op_idx = len(self.ops)
         op = Op(engine, slot, op_idx, group=group)
 
         pred_set = set()
+        zero_pred_set = set()
         if extra_preds:
             pred_set.update(extra_preds)
 
@@ -99,7 +107,10 @@ class OpGraph:
                     # Skip WAR for same-group readers on local addresses
                     if is_local and self.ops[r_idx].group == group:
                         continue
-                    pred_set.add(r_idx)
+                    if addr in self.zero_war_addrs:
+                        zero_pred_set.add(r_idx)
+                    else:
+                        pred_set.add(r_idx)
             self.last_writer[addr] = op_idx
             self.readers_since_write[addr] = []
 
@@ -114,6 +125,9 @@ class OpGraph:
         for pred_idx in pred_set:
             self.ops[pred_idx].succs.append(op_idx)
             op.pred_count += 1
+        for pred_idx in zero_pred_set:
+            self.ops[pred_idx].zero_succs.append(op_idx)
+            op.zero_pred_count += 1
 
         self.ops.append(op)
         return op_idx
@@ -169,65 +183,77 @@ def schedule_ops(graph):
     # Initialize ready lists per engine type
     from heapq import heappush, heappop
     ready_by_eng = defaultdict(list)  # engine -> heap of (-priority, op_id, op)
+    enqueued = [False] * n
 
     def push_ready(op):
+        if enqueued[op.id]:
+            return
+        enqueued[op.id] = True
         item = (-op.priority, op.id, op)
         heappush(ready_by_eng[op.engine], item)
 
     for op in ops:
-        if op.pred_count == 0:
+        if op.pred_count == 0 and op.zero_pred_count == 0:
             push_ready(op)
 
     bundles = []
-    newly_ready = []
 
     # Pack order: most constrained resources first
-    pack_order = ["valu", "load", "store", "flow", "alu"]
+    pack_order = ["flow", "load", "store", "valu", "alu"]
 
     def has_ready():
-        return any(ready_by_eng[e] for e in ready_by_eng)
+        return any(ready_by_eng[e] for e in pack_order)
 
-    while has_ready() or newly_ready:
-        if newly_ready:
-            for op in newly_ready:
-                push_ready(op)
-            newly_ready = []
+    remaining = n
 
+    while remaining:
         if not has_ready():
-            break
+            raise RuntimeError("Scheduler deadlock: no ready ops but work remains")
 
         bundle = {}
         scheduled_this = []
+        used = defaultdict(int)
 
-        # Pack each engine type in order of scarcity
-        for eng in pack_order:
-            limit = SLOT_LIMITS.get(eng, 0)
-            cnt = 0
-            heap = ready_by_eng[eng]
-            while heap and cnt < limit:
+        # Incremental packing: schedule <=1 op per engine per pass so latency-0 deps
+        # can unlock additional ops within the same cycle before constrained engines
+        # are fully consumed.
+        progress = True
+        while progress:
+            progress = False
+            for eng in pack_order:
+                limit = SLOT_LIMITS.get(eng, 0)
+                if used[eng] >= limit:
+                    continue
+                heap = ready_by_eng[eng]
+                if not heap:
+                    continue
                 neg_pri, op_id, op = heappop(heap)
                 bundle.setdefault(eng, []).append(op.slot)
                 scheduled_this.append(op)
-                cnt += 1
+                used[eng] += 1
+                remaining -= 1
+                progress = True
 
-        if not scheduled_this:
-            # Safety: force-schedule one op from any engine
-            for eng in pack_order:
-                heap = ready_by_eng[eng]
-                if heap:
-                    neg_pri, op_id, op = heappop(heap)
-                    bundle = {eng: [op.slot]}
-                    scheduled_this = [op]
-                    break
+                # Latency-0 deps: unlock successors immediately for this cycle.
+                for s_idx in op.zero_succs:
+                    succ = ops[s_idx]
+                    succ.zero_pred_count -= 1
+                    if succ.pred_count == 0 and succ.zero_pred_count == 0:
+                        push_ready(succ)
 
         bundles.append(bundle)
 
+        # Latency-1 deps: unlock successors next cycle.
+        next_ready = []
         for op in scheduled_this:
             for s_idx in op.succs:
                 succ = ops[s_idx]
                 succ.pred_count -= 1
                 if succ.pred_count == 0:
-                    newly_ready.append(succ)
+                    next_ready.append(succ)
+        for op in next_ready:
+            if op.zero_pred_count == 0:
+                push_ready(op)
 
     return bundles
 
@@ -538,6 +564,16 @@ class KernelBuilder:
         def vrange(base):
             return set(range(base, base + VLEN))
 
+        # WAR relaxation: allow same-cycle reader+writer on vb temp vectors.
+        # This exploits the machine's read-at-cycle-start/write-at-cycle-end semantics.
+        if int(os.environ.get("ZERO_WAR_VB", "1")):
+            zero_war_addrs = set()
+            for base in vtC:
+                zero_war_addrs.update(range(base, base + VLEN))
+            graph.mark_zero_war(zero_war_addrs)
+        if int(os.environ.get("ZERO_WAR_ALL", "0")):
+            graph.mark_zero_war(set(range(SCRATCH_SIZE)))
+
         # ---- Load input vectors inside the scheduled region (overlap vload with compute) ----
         # Use ptr_idx/ptr_val and tmp1/tmp2 as ping-pong pointer registers so vload and pointer
         # bump can be in the same cycle without introducing WAR edges in the dependency graph.
@@ -609,30 +645,29 @@ class KernelBuilder:
                         writes=vrange(vg_val), group=g
                     )
                 elif level == 2:
+                    # Reuse previous round's branch bit (vb) as cond0 for this level:
+                    # offset = idx - 3 => (offset & 1) == (prev_val & 1).
+                    #
+                    # Then overwrite vb with cond1 = (idx - 3) & 2 (same-cycle WAR allowed on vb).
                     graph.add_op(
-                        "valu", ("-", vt1, vg_idx, v_three),
-                        reads=vrange(vg_idx) | vrange(v_three),
+                        "flow", ("vselect", vt1, vb, v_tree4, v_tree3),
+                        reads=vrange(vb) | vrange(v_tree4) | vrange(v_tree3),
                         writes=vrange(vt1), group=g
                     )
                     graph.add_op(
-                        "valu", ("&", vt2, vt1, v_one),  # cond0: offset bit0
-                        reads=vrange(vt1) | vrange(v_one),
+                        "flow", ("vselect", vt2, vb, v_tree6, v_tree5),
+                        reads=vrange(vb) | vrange(v_tree6) | vrange(v_tree5),
                         writes=vrange(vt2), group=g
                     )
                     graph.add_op(
-                        "valu", ("&", vb, vt1, v_two),  # cond1: offset bit1 (nonzero => upper pair)
-                        reads=vrange(vt1) | vrange(v_two),
+                        "valu", ("-", vb, vg_idx, v_three),
+                        reads=vrange(vg_idx) | vrange(v_three),
                         writes=vrange(vb), group=g
                     )
                     graph.add_op(
-                        "flow", ("vselect", vt1, vt2, v_tree4, v_tree3),
-                        reads=vrange(vt2) | vrange(v_tree4) | vrange(v_tree3),
-                        writes=vrange(vt1), group=g
-                    )
-                    graph.add_op(
-                        "flow", ("vselect", vt2, vt2, v_tree6, v_tree5),
-                        reads=vrange(vt2) | vrange(v_tree6) | vrange(v_tree5),
-                        writes=vrange(vt2), group=g
+                        "valu", ("&", vb, vb, v_two),  # cond1: offset bit1 (nonzero => upper pair)
+                        reads=vrange(vb) | vrange(v_two),
+                        writes=vrange(vb), group=g
                     )
                     graph.add_op(
                         "flow", ("vselect", vt1, vb, vt2, vt1),
@@ -656,17 +691,49 @@ class KernelBuilder:
                         reads=vrange(vg_idx) | vrange(v_one),
                         writes=vrange(va), group=g
                     )
-                    graph.add_op(
-                        "valu", ("&", v_l3_cond0, va, v_one),
-                        reads=vrange(va) | vrange(v_one),
-                        writes=vrange(v_l3_cond0), group=g
-                    )
                     # b1 = w & 2  (nonzero => true for vselect)
                     graph.add_op(
                         "valu", ("&", v_l3_cond1, va, v_two),
                         reads=vrange(va) | vrange(v_two),
                         writes=vrange(v_l3_cond1), group=g
                     )
+
+                    # s0/s1 -> t0 (lower quad)
+                    graph.add_op(
+                        "flow", ("vselect", vn, vb, v_tree8, v_tree7),
+                        reads=vrange(vb) | vrange(v_tree8) | vrange(v_tree7),
+                        writes=vrange(vn), group=g
+                    )
+                    graph.add_op(
+                        "flow", ("vselect", v_l3_cond0, vb, v_tree10, v_tree9),
+                        reads=vrange(vb) | vrange(v_tree10) | vrange(v_tree9),
+                        writes=vrange(v_l3_cond0), group=g
+                    )
+                    graph.add_op(
+                        "flow", ("vselect", vn, v_l3_cond1, v_l3_cond0, vn),
+                        reads=vrange(v_l3_cond1) | vrange(v_l3_cond0) | vrange(vn),
+                        writes=vrange(vn), group=g
+                    )
+
+                    # s2/s3 -> t1 (upper quad)
+                    graph.add_op(
+                        "flow", ("vselect", v_l3_cond0, vb, v_tree12, v_tree11),
+                        reads=vrange(vb) | vrange(v_tree12) | vrange(v_tree11),
+                        writes=vrange(v_l3_cond0), group=g
+                    )
+                    graph.add_op(
+                        # Overwrite vb (cond0) after its last use as a condition:
+                        # cond and dest aliasing is safe (reads occur before writes within a cycle).
+                        "flow", ("vselect", vb, vb, v_tree14, v_tree13),
+                        reads=vrange(vb) | vrange(v_tree14) | vrange(v_tree13),
+                        writes=vrange(vb), group=g
+                    )
+                    graph.add_op(
+                        "flow", ("vselect", v_l3_cond0, v_l3_cond1, vb, v_l3_cond0),
+                        reads=vrange(v_l3_cond1) | vrange(vb) | vrange(v_l3_cond0),
+                        writes=vrange(v_l3_cond0), group=g
+                    )
+
                     # b2 = w & 4  (nonzero => true for vselect)
                     graph.add_op(
                         "valu", ("&", vb, va, v_four),
@@ -674,45 +741,9 @@ class KernelBuilder:
                         writes=vrange(vb), group=g
                     )
 
-                    # s0/s1 -> t0 (lower quad)
                     graph.add_op(
-                        "flow", ("vselect", vn, v_l3_cond0, v_tree8, v_tree7),
-                        reads=vrange(v_l3_cond0) | vrange(v_tree8) | vrange(v_tree7),
-                        writes=vrange(vn), group=g
-                    )
-                    graph.add_op(
-                        "flow", ("vselect", va, v_l3_cond0, v_tree10, v_tree9),
-                        reads=vrange(v_l3_cond0) | vrange(v_tree10) | vrange(v_tree9),
-                        writes=vrange(va), group=g
-                    )
-                    graph.add_op(
-                        "flow", ("vselect", vn, v_l3_cond1, va, vn),
-                        reads=vrange(v_l3_cond1) | vrange(va) | vrange(vn),
-                        writes=vrange(vn), group=g
-                    )
-
-                    # s2/s3 -> t1 (upper quad)
-                    graph.add_op(
-                        "flow", ("vselect", va, v_l3_cond0, v_tree12, v_tree11),
-                        reads=vrange(v_l3_cond0) | vrange(v_tree12) | vrange(v_tree11),
-                        writes=vrange(va), group=g
-                    )
-                    graph.add_op(
-                        # Reuse v_l3_cond0 as temp after its last use as the b0 condition.
-                        # Cond and dest aliasing is safe: reads occur before writes within a cycle.
-                        "flow", ("vselect", v_l3_cond0, v_l3_cond0, v_tree14, v_tree13),
-                        reads=vrange(v_l3_cond0) | vrange(v_tree14) | vrange(v_tree13),
-                        writes=vrange(v_l3_cond0), group=g
-                    )
-                    graph.add_op(
-                        "flow", ("vselect", va, v_l3_cond1, v_l3_cond0, va),
-                        reads=vrange(v_l3_cond1) | vrange(v_l3_cond0) | vrange(va),
-                        writes=vrange(va), group=g
-                    )
-
-                    graph.add_op(
-                        "flow", ("vselect", vn, vb, va, vn),
-                        reads=vrange(vb) | vrange(va) | vrange(vn),
+                        "flow", ("vselect", vn, vb, v_l3_cond0, vn),
+                        reads=vrange(vb) | vrange(v_l3_cond0) | vrange(vn),
                         writes=vrange(vn), group=g
                     )
 
