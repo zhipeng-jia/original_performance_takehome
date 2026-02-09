@@ -843,21 +843,26 @@ class KernelBuilder:
                     )
 
         # ---- Add final stores to the graph for overlapped scheduling ----
-        # Const loads for store pointers
+        # Use ping-pong pointers so store and pointer bump can be co-scheduled
+        # without WAR edges on the pointer register.
+        #
+        # Keep the indices pointer bump on ALU (plentiful slots) and move the
+        # values base pointer initialization + bumps to flow `add_imm` so it
+        # can often execute in flow-idle cycles (flow is otherwise mostly used
+        # for vselect in early levels).
         ptr_idx_load = graph.add_op(
             "load", ("const", ptr_idx, inp_indices_p_val),
             reads=set(), writes={ptr_idx}, group=-1
         )
-        ptr_val_load = graph.add_op(
-            "load", ("const", ptr_val, inp_values_p_val),
-            reads=set(), writes={ptr_val}, group=-1
+        ptr_val_init = graph.add_op(
+            "flow", ("add_imm", ptr_val, ptr_idx, batch_size),
+            reads={ptr_idx}, writes={ptr_val}, group=-1,
+            extra_preds=[ptr_idx_load],
         )
 
         for g in range(n_groups):
             vg_idx = vidx[g]
             vg_val = vval[g]
-            # 2 separate store ops per group; use ping-pong pointers so store and pointer
-            # bump can be co-scheduled (no WAR edge on the pointer register).
             if (g & 1) == 0:
                 ptr_i, ptr_v = ptr_idx, ptr_val
                 ptr_i_next, ptr_v_next = tmp1, tmp2
@@ -865,15 +870,15 @@ class KernelBuilder:
                 ptr_i, ptr_v = tmp1, tmp2
                 ptr_i_next, ptr_v_next = ptr_idx, ptr_val
 
-            s_idx = graph.add_op(
+            graph.add_op(
                 "store", ("vstore", ptr_i, vg_idx),
                 reads=vrange(vg_idx) | {ptr_i}, writes=set(), group=-1,
-                extra_preds=[ptr_idx_load]
+                extra_preds=[ptr_idx_load] if g == 0 else None,
             )
-            s_val = graph.add_op(
+            graph.add_op(
                 "store", ("vstore", ptr_v, vg_val),
                 reads=vrange(vg_val) | {ptr_v}, writes=set(), group=-1,
-                extra_preds=[ptr_val_load]
+                extra_preds=[ptr_val_init] if g == 0 else None,
             )
             if g != n_groups - 1:
                 graph.add_op(
@@ -881,8 +886,8 @@ class KernelBuilder:
                     reads={ptr_i, eight_const}, writes={ptr_i_next}, group=-1
                 )
                 graph.add_op(
-                    "alu", ("+", ptr_v_next, ptr_v, eight_const),
-                    reads={ptr_v, eight_const}, writes={ptr_v_next}, group=-1
+                    "flow", ("add_imm", ptr_v_next, ptr_v, 8),
+                    reads={ptr_v}, writes={ptr_v_next}, group=-1
                 )
 
         # Schedule all ops (main body + stores + pause)
