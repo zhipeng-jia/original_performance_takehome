@@ -596,13 +596,11 @@ class KernelBuilder:
                         )
                 elif level == 1:
                     graph.add_op(
-                        "valu", ("&", vn, vg_idx, v_one),
-                        reads=vrange(vg_idx) | vrange(v_one),
-                        writes=vrange(vn), group=g
-                    )
-                    graph.add_op(
-                        "flow", ("vselect", vn, vn, v_tree1, v_tree2),
-                        reads=vrange(vn) | vrange(v_tree1) | vrange(v_tree2),
+                        # At level 1, idx is (1 if prev_val even else 2).
+                        # Reuse the previous round's branch bit (vb = prev_val & 1):
+                        #   vb==0 => choose tree1, vb!=0 => choose tree2.
+                        "flow", ("vselect", vn, vb, v_tree2, v_tree1),
+                        reads=vrange(vb) | vrange(v_tree1) | vrange(v_tree2),
                         writes=vrange(vn), group=g
                     )
                     graph.add_op(
