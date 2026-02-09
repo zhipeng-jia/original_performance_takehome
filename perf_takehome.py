@@ -301,9 +301,13 @@ class KernelBuilder:
         # balance ALU vs VALU pressure (empirically best for this kernel).
         #
         # Set ADDR_ALU_MASK as a bitmask over tree levels (bit L => use ALU for level L).
-        # Tuned default for this kernel shape: using ALU on levels 5–8 tends to
-        # smooth ALU/VALU pressure peaks and improves schedule quality.
-        DEFAULT_ADDR_ALU_MASK = sum(1 << l for l in (5, 6, 7, 8))
+        # Tuned default for this kernel shape: using ALU on a subset of deeper
+        # scattered-load levels tends to smooth ALU/VALU pressure peaks and
+        # improves schedule quality.
+        #
+        # Empirically best for the reference benchmark (forest_height=10,
+        # rounds=16, batch_size=256): levels 5,6,8,10.
+        DEFAULT_ADDR_ALU_MASK = sum(1 << l for l in (5, 6, 8, 10))
         addr_alu_mask = int(os.environ.get("ADDR_ALU_MASK", str(DEFAULT_ADDR_ALU_MASK)))
 
         # ---- Compile-time known addresses ----
