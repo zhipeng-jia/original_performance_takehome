@@ -145,7 +145,7 @@ def schedule_ops(graph):
     W_PRELOAD = int(os.environ.get("SCHED_W_PRELOAD", "50000"))
     W_LOAD_DESC = int(os.environ.get("SCHED_W_LOAD_DESC", "0"))
     W_CP = int(os.environ.get("SCHED_W_CP", "10"))
-    W_GROUP_DEFAULT = int(os.environ.get("SCHED_W_GROUP", "0"))
+    W_GROUP_DEFAULT = int(os.environ.get("SCHED_W_GROUP", "25"))
 
     # Critical-path length (reverse topo order; ops are appended in topo order).
     cp_len = [0] * n
@@ -174,11 +174,16 @@ def schedule_ops(graph):
         # Ops that unlock many downstream loads are often on the throughput-critical spine.
         boost += load_desc[op.id] * W_LOAD_DESC
         # Stagger groups: lower group numbers get priority boost.
+        GROUP_POWER = float(os.environ.get("SCHED_GROUP_POWER", "2.0"))
+        GROUP_NORM = float(os.environ.get("SCHED_GROUP_NORM", "32.0"))
+        W_CP_ALU = int(os.environ.get("SCHED_W_CP_ALU", "2"))
+        W_CP_VALU = int(os.environ.get("SCHED_W_CP_VALU", "8"))
         if op.group >= 0:
-            group_boost = (32 - op.group) * W_GROUP_DEFAULT
+            group_boost = int((32 - op.group) ** GROUP_POWER / GROUP_NORM * W_GROUP_DEFAULT)
         else:
             group_boost = 0
-        op.priority = boost + group_boost + cp_len[op.id] * W_CP
+        engine_cp = {"valu": W_CP_VALU, "alu": W_CP_ALU}.get(op.engine, W_CP)
+        op.priority = boost + group_boost + cp_len[op.id] * engine_cp
 
     # Initialize ready lists per engine type
     from heapq import heappush, heappop
@@ -345,6 +350,15 @@ class KernelBuilder:
         s_C3 = self.alloc_scratch("s_C3")
         s_C5 = self.alloc_scratch("s_C5")
 
+        # ---- Hash VALU migration: balance ALU/VALU throughput ----
+        # Move hash stage 1 (XOR with C1) from 8 scalar ALU ops to 1 VALU op
+        # for a subset of groups. This reduces ALU pressure (the bottleneck)
+        # at the cost of slightly more VALU pressure.
+        # n_hash_valu_groups controls how many groups use VALU for stage 1.
+        # Optimal balancing: 4 groups -> LB drops from 1118 to 1083.
+        DEFAULT_HASH_VALU_GROUPS = 0
+        n_hash_valu_groups = int(os.environ.get("HASH_VALU_GROUPS", str(DEFAULT_HASH_VALU_GROUPS)))
+
         # ---- Allocate and initialize vector constants ----
         vec_const_defs = [
             ("v_one", 1),
@@ -360,6 +374,14 @@ class KernelBuilder:
             ("v_16", HASH_STAGES[5][4]),
             ("v_fvp", forest_values_p_val - 1),
         ]
+        # Add vector hash constant v_C1 for VALU-migrated groups
+        if n_hash_valu_groups > 0:
+            vec_const_defs.append(("v_C1", HASH_STAGES[1][1]))
+
+        # Level-0 vectorization: broadcast tree[0] and use VALU XOR instead of
+        # 8 scalar ALU XOR ops per group. Reduces ALU pressure (bottleneck)
+        # at modest VALU cost. Saves ~28 cycles empirically.
+        level0_valu = int(os.environ.get("LEVEL0_VALU", "1"))
         vec_const_addrs = {}
         for name, _ in vec_const_defs:
             vec_const_addrs[name] = self.alloc_scratch(name, VLEN)
@@ -408,6 +430,7 @@ class KernelBuilder:
         v_C4 = vec_const_addrs["v_C4"]
         v_16 = vec_const_addrs["v_16"]
         v_fvp = vec_const_addrs["v_fvp"]
+        v_C1 = vec_const_addrs.get("v_C1")  # None if n_hash_valu_groups == 0
 
         # ---- Allocate tree scratch (before pause, loads happen pre-pause) ----
         ptr_idx = self.alloc_scratch("ptr_idx")
@@ -448,6 +471,8 @@ class KernelBuilder:
         # Stripe level-3 condition vectors across groups to reduce inter-group coupling.
         v_l3_cond0 = self.alloc_scratch("v_l3_cond0", VLEN)
         v_l3_cond1 = self.alloc_scratch("v_l3_cond1", VLEN)
+        # Level-0 vectorized tree[0] broadcast (if enabled)
+        v_tree0 = self.alloc_scratch("v_tree0", VLEN) if level0_valu else None
 
         # ---- Load tree values from memory (pipelined pointers; no per-load consts) ----
         # tmp1/tmp2 already hold forest_values_p_val+0/+1 from the trailing vec-const bundle.
@@ -553,6 +578,10 @@ class KernelBuilder:
             (v_tree7, VLEN), (v_tree8, VLEN), (v_tree9, VLEN), (v_tree10, VLEN),
             (v_tree11, VLEN), (v_tree12, VLEN), (v_tree13, VLEN), (v_tree14, VLEN),
         ]
+        if v_C1 is not None:
+            const_addr_ranges.append((v_C1, VLEN))
+        if v_tree0 is not None:
+            const_addr_ranges.append((v_tree0, VLEN))
         const_addrs = set()
         for base, length in const_addr_ranges:
             for i in range(length):
@@ -608,6 +637,12 @@ class KernelBuilder:
             "valu", ("vbroadcast", v_tree14, tree_s14),
             reads={tree_s14}, writes=vrange(v_tree14), group=-1
         )
+        # v_tree0: broadcast tree[0] for vectorized level-0 XOR (if enabled)
+        if v_tree0 is not None:
+            graph.add_op(
+                "valu", ("vbroadcast", v_tree0, tree_s0),
+                reads={tree_s0}, writes=vrange(v_tree0), group=-1
+            )
 
         for r in range(rounds):
             level = tree_level(r)
@@ -622,13 +657,21 @@ class KernelBuilder:
                 vb = vtC[g]     # per-group branch bit (shortens coupling)
 
                 if level == 0:
-                    # tree[0] is a scalar: don't spend scratch on a full vector broadcast.
-                    for i in range(VLEN):
+                    if v_tree0 is not None:
+                        # Vectorized: 1 VALU XOR with broadcast tree[0]
                         graph.add_op(
-                            "alu", ("^", vg_val + i, vg_val + i, tree_s0),
-                            reads={vg_val + i, tree_s0},
-                            writes={vg_val + i}, group=g
+                            "valu", ("^", vg_val, vg_val, v_tree0),
+                            reads=vrange(vg_val) | vrange(v_tree0),
+                            writes=vrange(vg_val), group=g
                         )
+                    else:
+                        # tree[0] is a scalar: don't spend scratch on a full vector broadcast.
+                        for i in range(VLEN):
+                            graph.add_op(
+                                "alu", ("^", vg_val + i, vg_val + i, tree_s0),
+                                reads={vg_val + i, tree_s0},
+                                writes={vg_val + i}, group=g
+                            )
                 elif level == 1:
                     graph.add_op(
                         # At level 1, idx is (1 if prev_val even else 2).
@@ -767,12 +810,21 @@ class KernelBuilder:
                     reads=vrange(vg_val) | vrange(v_mul_4097) | vrange(v_C0),
                     writes=vrange(vg_val), group=g
                 )
-                for i in range(VLEN):
+                # Stage 1: (a ^ C1) ^ (a >> 19)
+                # For VALU-migrated groups: 1 VALU(^) replaces 8 ALU(^)
+                if v_C1 is not None and g < n_hash_valu_groups:
                     graph.add_op(
-                        "alu", ("^", vt1 + i, vg_val + i, s_C1),
-                        reads={vg_val + i, s_C1},
-                        writes={vt1 + i}, group=g
+                        "valu", ("^", vt1, vg_val, v_C1),
+                        reads=vrange(vg_val) | vrange(v_C1),
+                        writes=vrange(vt1), group=g
                     )
+                else:
+                    for i in range(VLEN):
+                        graph.add_op(
+                            "alu", ("^", vt1 + i, vg_val + i, s_C1),
+                            reads={vg_val + i, s_C1},
+                            writes={vt1 + i}, group=g
+                        )
                 graph.add_op(
                     "valu", (">>", vt2, vg_val, v_19),
                     reads=vrange(vg_val) | vrange(v_19),
