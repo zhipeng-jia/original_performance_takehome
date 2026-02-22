@@ -133,16 +133,27 @@ class OpGraph:
         return op_idx
 
 
-def schedule_ops(graph):
-    """Schedule ops into VLIW instruction bundles using a greedy list scheduler."""
-    ops = graph.ops
+def _mix32(x: int) -> int:
+    """Cheap deterministic mixer for tie-breaking."""
+    x &= 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x ^= x >> 15
+    x = (x * 0x846CA68B) & 0xFFFFFFFF
+    x ^= x >> 16
+    return x
+
+
+def _compute_priorities(ops):
     n = len(ops)
     if n == 0:
-        return []
+        return
 
     # Weights (override via env for local tuning).
     W_LOAD = int(os.environ.get("SCHED_W_LOAD", "100000"))
     W_PRELOAD = int(os.environ.get("SCHED_W_PRELOAD", "50000"))
+    W_STORE = int(os.environ.get("SCHED_W_STORE", "0"))
+    W_PRESTORE = int(os.environ.get("SCHED_W_PRESTORE", "0"))
     W_LOAD_DESC = int(os.environ.get("SCHED_W_LOAD_DESC", "0"))
     # Defaults tuned for this kernel shape; env vars allow local retuning.
     W_CP = int(os.environ.get("SCHED_W_CP", "13"))
@@ -174,10 +185,15 @@ def schedule_ops(graph):
         # Boost loads and the ops that feed loads (addr_calc-style predecessors).
         if op.engine == "load":
             boost += W_LOAD
+        elif op.engine == "store":
+            boost += W_STORE
         else:
             for s_idx in op.succs:
                 if ops[s_idx].engine == "load":
                     boost += W_PRELOAD
+                    break
+                if ops[s_idx].engine == "store":
+                    boost += W_PRESTORE
                     break
         # Ops that unlock many downstream loads are often on the throughput-critical spine.
         boost += load_desc[op.id] * W_LOAD_DESC
@@ -188,26 +204,40 @@ def schedule_ops(graph):
             group_boost = 0
         op.priority = boost + group_boost + cp_len[op.id] * W_CP
 
+
+def _schedule_with_priorities(ops, *, tie_seed: int = 0, pack_order=None):
+    """Schedule ops into VLIW instruction bundles using a greedy list scheduler."""
+    n = len(ops)
+    if n == 0:
+        return []
+
+    # Use local dep counts so we can run the scheduler multiple times on the same graph.
+    pred_count = [op.pred_count for op in ops]
+    zero_pred_count = [op.zero_pred_count for op in ops]
+
     # Initialize ready lists per engine type
     from heapq import heappush, heappop
-    ready_by_eng = defaultdict(list)  # engine -> heap of (-priority, op_id, op)
+    ready_by_eng = defaultdict(list)  # engine -> heap of (-priority, tie, op_id)
     enqueued = [False] * n
 
-    def push_ready(op):
-        if enqueued[op.id]:
+    def push_ready(op_id: int):
+        if enqueued[op_id]:
             return
-        enqueued[op.id] = True
-        item = (-op.priority, op.id, op)
+        enqueued[op_id] = True
+        op = ops[op_id]
+        tie = _mix32(op_id ^ (tie_seed * 0x9E3779B9))
+        item = (-op.priority, tie, op_id)
         heappush(ready_by_eng[op.engine], item)
 
     for op in ops:
-        if op.pred_count == 0 and op.zero_pred_count == 0:
-            push_ready(op)
+        if pred_count[op.id] == 0 and zero_pred_count[op.id] == 0:
+            push_ready(op.id)
 
     bundles = []
 
     # Pack order: most constrained resources first
-    pack_order = ["flow", "load", "store", "valu", "alu"]
+    if pack_order is None:
+        pack_order = ["flow", "load", "store", "valu", "alu"]
 
     def has_ready():
         return any(ready_by_eng[e] for e in pack_order)
@@ -235,35 +265,68 @@ def schedule_ops(graph):
                 heap = ready_by_eng[eng]
                 if not heap:
                     continue
-                neg_pri, op_id, op = heappop(heap)
+                neg_pri, tie, op_id = heappop(heap)
+                op = ops[op_id]
                 bundle.setdefault(eng, []).append(op.slot)
-                scheduled_this.append(op)
+                scheduled_this.append(op_id)
                 used[eng] += 1
                 remaining -= 1
                 progress = True
 
                 # Latency-0 deps: unlock successors immediately for this cycle.
                 for s_idx in op.zero_succs:
-                    succ = ops[s_idx]
-                    succ.zero_pred_count -= 1
-                    if succ.pred_count == 0 and succ.zero_pred_count == 0:
-                        push_ready(succ)
+                    zero_pred_count[s_idx] -= 1
+                    if pred_count[s_idx] == 0 and zero_pred_count[s_idx] == 0:
+                        push_ready(s_idx)
 
         bundles.append(bundle)
 
         # Latency-1 deps: unlock successors next cycle.
         next_ready = []
-        for op in scheduled_this:
+        for op_id in scheduled_this:
+            op = ops[op_id]
             for s_idx in op.succs:
-                succ = ops[s_idx]
-                succ.pred_count -= 1
-                if succ.pred_count == 0:
-                    next_ready.append(succ)
-        for op in next_ready:
-            if op.zero_pred_count == 0:
-                push_ready(op)
+                pred_count[s_idx] -= 1
+                if pred_count[s_idx] == 0:
+                    next_ready.append(s_idx)
+        for op_id in next_ready:
+            if zero_pred_count[op_id] == 0:
+                push_ready(op_id)
 
     return bundles
+
+
+def schedule_ops(graph, *, tie_seed: int = 0, pack_order=None):
+    """One-shot scheduler (priority calc + list scheduling)."""
+    ops = graph.ops
+    _compute_priorities(ops)
+    return _schedule_with_priorities(ops, tie_seed=tie_seed, pack_order=pack_order)
+
+
+def schedule_ops_best(graph):
+    """Run a few cheap variants and keep the shortest schedule."""
+    ops = graph.ops
+    if not ops:
+        return []
+
+    _compute_priorities(ops)
+
+    tries = int(os.environ.get("SCHED_TRIES", "16"))
+    pack_orders = [
+        ["flow", "load", "store", "valu", "alu"],
+        ["load", "flow", "store", "valu", "alu"],
+    ]
+
+    best = None
+    best_len = 1 << 30
+    for order in pack_orders:
+        for seed in range(tries):
+            bundles = _schedule_with_priorities(ops, tie_seed=seed, pack_order=order)
+            blen = len(bundles)
+            if blen < best_len:
+                best = bundles
+                best_len = blen
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +380,13 @@ class KernelBuilder:
         # eight_const computed via flow(add_imm) during vec const init
         eight_const = self.alloc_scratch("eight")
         two_const = self.alloc_scratch("two")
+
+        # Pointers + scalar tree[0] value (initialized later).
+        ptr_idx = self.alloc_scratch("ptr_idx")
+        ptr_val = self.alloc_scratch("ptr_val")
+        ptr_tree = self.alloc_scratch("ptr_tree")
+        ptr_tree8 = self.alloc_scratch("ptr_tree8")
+        tree_s0 = self.alloc_scratch("tree_s0")
 
         # ---- Allocate persistent vectors (32 groups x 2 vectors x 8 elements) ----
         vidx = []
@@ -384,16 +454,18 @@ class KernelBuilder:
             bundle["load"] = loads
             self.instrs.append(bundle)
         if pending_broadcasts:
-            # Merge trailing broadcasts with first tree address const loads
+            # Merge trailing broadcasts with initial pointer constants.
             self.instrs.append({
                 "valu": [("vbroadcast", addr, src) for addr, src in pending_broadcasts],
-                "load": [("const", tmp1, forest_values_p_val + 0),
-                         ("const", tmp2, forest_values_p_val + 1)]
+                "load": [("const", ptr_tree, forest_values_p_val),
+                         ("const", ptr_val, inp_values_p_val)]
             })
 
         v_one = vec_const_addrs["v_one"]
         v_two = vec_const_addrs["v_two"]
         v_l2_tmp = vec_const_addrs["v_l2_tmp"]
+        # Stripe the level-2 temp across two vectors to reduce artificial cross-group coupling.
+        v_l2_tmp2 = self.alloc_scratch("v_l2_tmp2", VLEN)
         v_mul_4097 = vec_const_addrs["v_mul_4097"]
         v_C0 = vec_const_addrs["v_C0"]
         v_19 = vec_const_addrs["v_19"]
@@ -404,25 +476,12 @@ class KernelBuilder:
         v_16 = vec_const_addrs["v_16"]
         v_fvp = vec_const_addrs["v_fvp"]
 
-        # ---- Allocate tree scratch (before pause, loads happen pre-pause) ----
-        ptr_idx = self.alloc_scratch("ptr_idx")
-        ptr_val = self.alloc_scratch("ptr_val")
-        tree_s0 = self.alloc_scratch("tree_s0")
-        tree_s1 = self.alloc_scratch("tree_s1")
-        tree_s2 = self.alloc_scratch("tree_s2")
-        # Reuse a few tree scalar slots to hold scalar diffs (saves 3 scratch words):
-        # - tree_s1 will hold (tree1 - tree2)
-        # - tree_s4 will hold (tree4 - tree3)
-        # - tree_s6 will hold (tree6 - tree5)
-        v_tree2 = self.alloc_scratch("v_tree2", VLEN)
+        # ---- Preloaded tree node vectors ----
         v_tree1 = self.alloc_scratch("v_tree1", VLEN)
-        tree_s3 = self.alloc_scratch("tree_s3")
-        tree_s4 = self.alloc_scratch("tree_s4")
-        tree_s5 = self.alloc_scratch("tree_s5")
-        tree_s6 = self.alloc_scratch("tree_s6")
+        v_tree2 = self.alloc_scratch("v_tree2", VLEN)
         v_tree3 = self.alloc_scratch("v_tree3", VLEN)
-        v_tree5 = self.alloc_scratch("v_tree5", VLEN)
         v_tree4 = self.alloc_scratch("v_tree4", VLEN)
+        v_tree5 = self.alloc_scratch("v_tree5", VLEN)
         v_tree6 = self.alloc_scratch("v_tree6", VLEN)
         # Address representation: keep "idx" vectors as absolute memory addresses
         # (forest_values_p + idx). Updating address each round avoids scattered
@@ -430,14 +489,6 @@ class KernelBuilder:
         #   addr_next = 2*addr + (1 - forest_values_p) + b
         # where b = val & 1.
         v_addr_bias = self.alloc_scratch("v_addr_bias", VLEN)
-        tree_s7 = self.alloc_scratch("tree_s7")
-        tree_s8 = self.alloc_scratch("tree_s8")
-        tree_s9 = self.alloc_scratch("tree_s9")
-        tree_s10 = self.alloc_scratch("tree_s10")
-        tree_s11 = self.alloc_scratch("tree_s11")
-        tree_s12 = self.alloc_scratch("tree_s12")
-        tree_s13 = self.alloc_scratch("tree_s13")
-        tree_s14 = self.alloc_scratch("tree_s14")
         v_tree7 = self.alloc_scratch("v_tree7", VLEN)
         v_tree8 = self.alloc_scratch("v_tree8", VLEN)
         v_tree9 = self.alloc_scratch("v_tree9", VLEN)
@@ -446,83 +497,9 @@ class KernelBuilder:
         v_tree12 = self.alloc_scratch("v_tree12", VLEN)
         v_tree13 = self.alloc_scratch("v_tree13", VLEN)
         v_tree14 = self.alloc_scratch("v_tree14", VLEN)
-        # Stripe level-3 condition vectors across groups to reduce inter-group coupling.
+        # Shared level-3 condition vectors (also reused as raw tree vload buffers).
         v_l3_cond0 = self.alloc_scratch("v_l3_cond0", VLEN)
         v_l3_cond1 = self.alloc_scratch("v_l3_cond1", VLEN)
-
-        # ---- Load tree values from memory (pipelined pointers; no per-load consts) ----
-        # tmp1/tmp2 already hold forest_values_p_val+0/+1 from the trailing vec-const bundle.
-        # Use ALU to bump both pointers by 2 so the load engine can do 2 memory loads/cycle.
-        tree_scalars = [
-            tree_s0, tree_s1, tree_s2, tree_s3, tree_s4, tree_s5, tree_s6, tree_s7,
-            tree_s8, tree_s9, tree_s10, tree_s11, tree_s12, tree_s13, tree_s14,
-        ]
-        for k in range(0, len(tree_scalars), 2):
-            bundle = {
-                "load": [("load", tree_scalars[k], tmp1)],
-                "alu": [("+", tmp1, tmp1, two_const), ("+", tmp2, tmp2, two_const)],
-            }
-            if k + 1 < len(tree_scalars):
-                bundle["load"].append(("load", tree_scalars[k + 1], tmp2))
-            # Build address-update bias once: v_addr_bias = (1 - forest_values_p).
-            if k == 0:
-                bundle["valu"] = [("-", v_addr_bias, v_one, v_fvp)]
-            # Pipeline vbroadcasts for the preloaded tree constants into otherwise VALU-idle
-            # prologue cycles. Sources become available 1 cycle after their scalar load / diff.
-            if k == 4:
-                bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_tree1, tree_s1),
-                    ("vbroadcast", v_tree2, tree_s2),
-                    ("vbroadcast", v_tree3, tree_s3),
-                ])
-            elif k == 6:
-                bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_tree4, tree_s4),
-                ])
-            elif k == 8:
-                bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_tree6, tree_s6),
-                    ("vbroadcast", v_tree7, tree_s7),
-                ])
-            elif k == 10:
-                bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_tree5, tree_s5),
-                    ("vbroadcast", v_tree8, tree_s8),
-                    ("vbroadcast", v_tree9, tree_s9),
-                ])
-            elif k == 12:
-                bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_tree10, tree_s10),
-                    ("vbroadcast", v_tree11, tree_s11),
-                ])
-            elif k == 14:
-                bundle.setdefault("valu", []).extend([
-                    ("vbroadcast", v_tree12, tree_s12),
-                    ("vbroadcast", v_tree13, tree_s13),
-                ])
-            # Scalar diffs become available one cycle after the 2nd operand load.
-            if k == 4:
-                bundle["alu"].append(("-", tree_s1, tree_s1, tree_s2))
-            elif k == 6:
-                bundle["alu"].append(("-", tree_s4, tree_s4, tree_s3))
-            elif k == 8:
-                # diff56 = tree6 - tree5
-                bundle["alu"].append(("-", tree_s6, tree_s6, tree_s5))
-            elif k == 10:
-                # Repurpose (after diff56 is computed above):
-                # - tree_s5 becomes (tree5 - tree3)
-                # - tree_s6 becomes ((tree6 - tree5) - (tree4 - tree3))
-                bundle["alu"].append(("-", tree_s5, tree_s5, tree_s3))
-                bundle["alu"].append(("-", tree_s6, tree_s6, tree_s4))
-            # Initialize input pointers via flow (scratch starts at 0).
-            if k == 12:
-                bundle["flow"] = [("add_imm", ptr_idx, ptr_idx, inp_indices_p_val)]
-            elif k == 14:
-                # Use the spare load slot (only 1 scalar tree load this cycle) to init ptr_val,
-                # and pause here so external harnesses can treat the next phase as "kernel body".
-                bundle["load"].append(("const", ptr_val, inp_values_p_val))
-                bundle["flow"] = [("pause",)]
-            self.instrs.append(bundle)
 
         # ---- Phase 2: Main loop - build op graph for scheduler ----
         graph = OpGraph()
@@ -562,7 +539,7 @@ class KernelBuilder:
         for base, length in const_addr_ranges:
             for i in range(length):
                 const_addrs.add(base + i)
-        const_addrs.update({s_C1, s_C3, s_C5})
+        const_addrs.update({s_C1, s_C3, s_C5, tree_s0})
         graph.mark_constants(const_addrs)
 
         def vrange(base):
@@ -588,7 +565,7 @@ class KernelBuilder:
                 zero_war_idx.update(range(base, base + VLEN))
             graph.mark_zero_war(zero_war_idx)
         if int(os.environ.get("ZERO_WAR_SHARED", "0")):
-            graph.mark_zero_war(vrange(v_l2_tmp) | vrange(v_l3_cond0) | vrange(v_l3_cond1))
+            graph.mark_zero_war(vrange(v_l2_tmp) | vrange(v_l2_tmp2) | vrange(v_l3_cond0) | vrange(v_l3_cond1))
         # Hash mixing writes into vval in-place; allow same-cycle reads (shifts)
         # and ALU writes into vval lanes.
         zero_war_vals = set()
@@ -597,6 +574,56 @@ class KernelBuilder:
         graph.mark_zero_war(zero_war_vals)
         if int(os.environ.get("ZERO_WAR_ALL", "0")):
             graph.mark_zero_war(set(range(SCRATCH_SIZE)))
+
+        # ---- Tree preload + constants (scheduled region) ----
+        # Build address-update bias once: v_addr_bias = (1 - forest_values_p).
+        graph.add_op(
+            "valu", ("-", v_addr_bias, v_one, v_fvp),
+            reads=vrange(v_one) | vrange(v_fvp),
+            writes=vrange(v_addr_bias), group=-1
+        )
+
+        # Load tree[0] as a scalar for the level-0 rounds (r==0 and r==11).
+        # Also vload the first 16 tree values into v_l3_cond0/1 so we can vbroadcast
+        # v_tree1..v_tree14 without spending 15 scalar loads.
+        graph.add_op(
+            "load", ("load", tree_s0, ptr_tree),
+            reads={ptr_tree}, writes={tree_s0}, group=-1
+        )
+        graph.add_op(
+            "load", ("vload", v_l3_cond0, ptr_tree),
+            reads={ptr_tree}, writes=vrange(v_l3_cond0), group=-1
+        )
+        graph.add_op(
+            "flow", ("add_imm", ptr_tree8, ptr_tree, 8),
+            reads={ptr_tree}, writes={ptr_tree8}, group=-1
+        )
+        graph.add_op(
+            "load", ("vload", v_l3_cond1, ptr_tree8),
+            reads={ptr_tree8}, writes=vrange(v_l3_cond1), group=-1
+        )
+
+        # Broadcast the preloaded nodes (1..14) into constant vectors.
+        for vdest, src in (
+            (v_tree1, v_l3_cond0 + 1),
+            (v_tree2, v_l3_cond0 + 2),
+            (v_tree3, v_l3_cond0 + 3),
+            (v_tree4, v_l3_cond0 + 4),
+            (v_tree5, v_l3_cond0 + 5),
+            (v_tree6, v_l3_cond0 + 6),
+            (v_tree7, v_l3_cond0 + 7),
+            (v_tree8, v_l3_cond1 + 0),
+            (v_tree9, v_l3_cond1 + 1),
+            (v_tree10, v_l3_cond1 + 2),
+            (v_tree11, v_l3_cond1 + 3),
+            (v_tree12, v_l3_cond1 + 4),
+            (v_tree13, v_l3_cond1 + 5),
+            (v_tree14, v_l3_cond1 + 6),
+        ):
+            graph.add_op(
+                "valu", ("vbroadcast", vdest, src),
+                reads={src}, writes=vrange(vdest), group=-1
+            )
 
         # ---- Load input values inside the scheduled region (overlap vload with compute) ----
         # Indices are always 0 for this benchmark/input generator; initialize per-group
@@ -624,13 +651,6 @@ class KernelBuilder:
                     "alu", ("+", ptr_v_next, ptr_v, eight_const),
                     reads={ptr_v, eight_const}, writes={ptr_v_next}, group=-1
                 )
-
-        # v_tree14 is loaded in the last scalar tree-load bundle (k==14) so its vbroadcast
-        # cannot be hoisted pre-pause without adding a cycle. Schedule it early here instead.
-        graph.add_op(
-            "valu", ("vbroadcast", v_tree14, tree_s14),
-            reads={tree_s14}, writes=vrange(v_tree14), group=-1
-        )
 
         for r in range(rounds):
             level = tree_level(r)
@@ -667,19 +687,20 @@ class KernelBuilder:
                 elif level == 2:
                     # Select among preloaded nodes (3..6) using stored branch bits:
                     # idx = 3 + (b0<<1) + b1
+                    v_l2 = v_l2_tmp if (g & 1) == 0 else v_l2_tmp2
                     graph.add_op(
                         "flow", ("vselect", vn, vb1, v_tree4, v_tree3),
                         reads=vrange(vb1) | vrange(v_tree4) | vrange(v_tree3),
                         writes=vrange(vn), group=g
                     )
                     graph.add_op(
-                        "flow", ("vselect", v_l2_tmp, vb1, v_tree6, v_tree5),
+                        "flow", ("vselect", v_l2, vb1, v_tree6, v_tree5),
                         reads=vrange(vb1) | vrange(v_tree6) | vrange(v_tree5),
-                        writes=vrange(v_l2_tmp), group=g
+                        writes=vrange(v_l2), group=g
                     )
                     graph.add_op(
-                        "flow", ("vselect", vn, vb0, v_l2_tmp, vn),
-                        reads=vrange(vb0) | vrange(v_l2_tmp) | vrange(vn),
+                        "flow", ("vselect", vn, vb0, v_l2, vn),
+                        reads=vrange(vb0) | vrange(v_l2) | vrange(vn),
                         writes=vrange(vn), group=g
                     )
                     graph.add_op(
@@ -900,7 +921,7 @@ class KernelBuilder:
 
         # Schedule all ops (main body + stores + pause)
         self.last_graph = graph
-        all_bundles = schedule_ops(graph)
+        all_bundles = schedule_ops_best(graph)
         # Final pause (without adding an extra cycle): merge into the last bundle.
         if all_bundles:
             all_bundles[-1].setdefault("flow", []).append(("pause",))
