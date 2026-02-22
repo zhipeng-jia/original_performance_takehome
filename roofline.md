@@ -1,5 +1,9 @@
 # Roofline Analysis: VLIW SIMD Tree-Traversal Hash Kernel
 
+**Current optimized kernel (`perf_takehome.py`)**: **1172 cycles** on the submission benchmark (`forest_height=10`, `rounds=16`, `batch_size=256`) with the default settings in this repo.
+
+The provided execution trace (`trace.json`, from the earlier 1189-cycle schedule) and the current static instruction mix both show the kernel is **compute-bound** (VALU/ALU) and within ~**20 cycles** of the pure throughput roofline for the current schedule.
+
 ## 1. Machine Architecture Summary
 
 The target is a custom single-core VLIW (Very Long Instruction Word) SIMD processor with the following per-cycle resource limits:
@@ -68,9 +72,9 @@ The stages are:
 
 ## 3. Operation Count Analysis
 
-### Baseline (current code): 1 slot per instruction bundle
+### Starter baseline (for context): ~1 slot per instruction bundle
 
-The current code issues one operation per cycle. Per element per round:
+The original starter code issues one operation per cycle. Per element per round:
 
 | Operation | Count | Engine |
 |-----------|-------|--------|
@@ -85,6 +89,28 @@ The current code issues one operation per cycle. Per element per round:
 | **Total** | **37** | |
 
 **Baseline total: 37 × 256 × 16 = 151,552 instructions ≈ 147,734 cycles** (close to reported baseline).
+
+### Current optimized kernel (unrolled + list-scheduled VLIW)
+
+The current kernel is a straight-line program (no runtime branching when `pause` is disabled in tests), so the cycle count equals the number of non-debug VLIW bundles.
+
+Static instruction mix for the current best schedule (**1172 cycles**):
+
+| Engine | Slot Demand | Slots/Cycle | Throughput Bound | Avg Utilization |
+|--------|-------------|------------:|-----------------:|----------------:|
+| **VALU** | 6,907 | 6 | **1,152** | **98.2%** |
+| **ALU** | 13,682 | 12 | 1,141 | 97.3% |
+| **Load** | 2,146 | 2 | 1,073 | 91.6% |
+| **Flow** | 741 | 1 | 741 | 63.2% |
+| **Store** | 64 | 2 | 32 | 2.7% |
+
+So the pure throughput roofline is **1152 cycles** (VALU-bound). The measured **1172** is ~**1.7%** above this bound, indicating remaining headroom is mostly from **dependencies / scheduler suboptimality**, not unused engine capacity.
+
+Notable op mix (counts across the full program):
+- **VALU**: `multiply_add` 2016, `^` 2016, `>>` 1024, `+` 705, `&` 608, `<<` 512
+- **ALU**: `^` 8704, `+` 4973
+- **Load**: scattered `load` 2063 (2048 node loads + 15 tree preloads), `vload` 64 (idx/val), `const` 19
+- **Flow**: `vselect` 704 (tree lookup for early levels), `add_imm` 35, `pause` 2
 
 ### Vectorized operation count (VLEN=8, 32 groups)
 
@@ -153,104 +179,59 @@ This applies to stages 0, 2, 4 (3 of 6 stages):
 
 **VALU savings: 33% fewer hash ops (18 → 12).**
 
-### 4c. Eliminating flow ops with ALU tricks
+### 4c. Flow engine: when to use `vselect` vs. VALU/ALU tricks
 
-The branch direction and wrap check can be converted from flow ops to pure VALU:
+It’s possible to “eliminate flow” by expressing selection with arithmetic, but for the current optimized kernel:
+- **Flow is not saturated** (≈63% utilized), so spending flow slots is often fine if it reduces VALU pressure.
+- `vselect` is especially valuable for **tree lookup** at shallow levels once those node values are preloaded into scratch.
 
-**Branch direction** (original uses `%`, `==`, flow `select`):
+Arithmetic selection is still a useful tool. For example, branch direction can be computed without flow:
 ```
-# Original: 2 ALU + 1 flow select
-tmp = val % 2; cond = (tmp == 0); offset = select(cond, 1, 2)
-
-# Optimized: pure VALU
 tmp = val & 1                          # valu &
 tmp = tmp + 1                          # valu +   (gives 1 if even, 2 if odd)
 idx = multiply_add(idx, 2, tmp)        # valu multiply_add  (2*idx + tmp)
 ```
-3 VALU ops, 0 flow ops.
 
-**Wrap check** (original uses `<`, flow `select`):
-```
-# Original: 1 ALU + 1 flow select
-cond = (idx < n_nodes); idx = select(cond, idx, 0)
+For wrap: in this benchmark shape, wrap only occurs after visiting depth-10 nodes, and the current kernel handles it by unconditionally setting `idx = 0` on round 10.
 
-# Optimized: pure VALU
-cond = idx < n_nodes                   # valu <
-idx = idx * cond                       # valu *   (0 if cond=0, idx if cond=1)
-```
-2 VALU ops, 0 flow ops.
+### 4d. Used in the current kernel: preload levels 0–3 and `vselect` tree lookup
 
-**Result: Flow engine completely eliminated from inner loop.** Flow is no longer a bottleneck (0 flow ops vs. 1 slot/cycle).
+All elements start at index 0, so the first few rounds touch only a small, fixed set of nodes. The current kernel exploits this by:
+- Preloading `tree[0..14]` into scratch once.
+- Using flow `vselect` cascades at levels 1–3 to select the correct node value per lane without scattered loads.
 
-### 4d. Exploiting tree traversal structure
+For `rounds=16` with the level pattern `0,1,2,3,4,5,6,7,8,9,10,0,1,2,3,4`, this yields:
+- **No scattered loads** for levels **0–3** (8 rounds total).
+- **Scattered loads** only for levels **4–10 and 4** (8 rounds total) ⇒ `8 × 32 × 8 = 2048` node loads, plus 15 scalar tree preloads.
 
-All 256 elements start at index 0. The tree has height 10, so elements follow a structured traversal:
+There are deeper structure-based load-sharing tricks (e.g., sharing loads when the number of reachable nodes is small), but since the kernel is now compute-bound, load reductions alone often don’t move the cycle count unless they also cut VALU/ALU work or shorten critical dependencies.
 
-| Round | Tree Level Accessed | Max Unique Nodes | Loads Needed |
-|-------|-------------------|-------------------|-------------|
-| 0 | 0 | 1 | 1 |
-| 1 | 1 | 2 | 2 |
-| 2 | 2 | 4 | 4 |
-| 3 | 3 | 8 | 8 |
-| 4 | 4 | 16 | 16 |
-| 5 | 5 | 32 | 32 |
-| 6 | 6 | 64 | 64 |
-| 7 | 7 | 128 | 128 |
-| 8 | 8 | 256 | ≤256 |
-| 9 | 9 | 256 | ≤256 |
-| 10 | 10 | 256 | ≤256 |
-| 11 | 0 (wrapped) | 1 | 1 |
-| 12 | 1 | 2 | 2 |
-| 13 | 2 | 4 | 4 |
-| 14 | 3 | 8 | 8 |
-| 15 | 4 | 16 | 16 |
+### 4e. Address formation: ALU vs VALU tradeoff (`ADDR_ALU_MASK`)
 
-**Key insight**: After round 10, ALL elements wrap to index 0 (because any child of a level-10 node exceeds `n_nodes = 2047`). The traversal pattern repeats from round 11.
+In scattered-load rounds (levels ≥ 4), forming `addr = idx + forest_values_p` can be done either as:
+- **1 VALU** vector add, or
+- **8 ALU** scalar adds (one per lane).
 
-**Total loads: 1+2+4+8+16+32+64+128+256+256+256+1+2+4+8+16 = 1,054 loads**
+Because the current kernel is **VALU-bound**, it’s beneficial to shift selected address work onto ALU to relieve VALU pressure. The best default for this repo is:
+- `ADDR_ALU_MASK` bits set for **levels 5, 6, 8**.
 
-Compared to 4,096 scattered loads without this optimization (256 × 16), this is a **3.9× reduction**.
+### 4f. Micro-optimization: reuse branch-history bits at level 2
 
-At 2 loads/cycle: **527 cycles** (no longer the bottleneck).
+At level 2, the node selection depends on bits of `(idx - 3)`. Those bits can be derived from previously-computed branch bits:
+- `(idx - 3) & 2` is exactly the **level-0 branch bit** (`b0`), which can be kept live.
+- `(idx - 3) & 1` is exactly the **level-1 branch bit** (`b1`), which can be stored in a temp vector and reused.
 
-### 4e. Eliminating wrap computation for known-safe rounds
+Reusing these bits avoids recomputing offset bits from `idx` and removes **2 VALU ops per group** for each level-2 round.
 
-Since elements follow the tree level-by-level, wrapping only occurs after round 10 (from level 10). For all other rounds, `2*idx + 2 < n_nodes` is guaranteed, so the wrap check can be skipped:
+### 4g. Roofline for the current optimized kernel
 
-| Rounds | Wrap needed? | Branch+Wrap VALU ops |
-|--------|-------------|---------------------|
-| 0-9, 11-15 (15 rounds) | No | 3 (branch only) |
-| 10 | Always wraps to 0 | 1 (just broadcast zero) |
+Using the static instruction mix in §3, the pure throughput bound is:
+`max(ceil(VALU/6), ceil(ALU/12), ceil(Load/2), ceil(Flow/1), ceil(Store/2))`
+= `max(1152, 1141, 1073, 741, 32)` = **1152 cycles** (VALU-bound).
 
-### 4f. Fully Optimized VALU Throughput Bound
+Measured: **1172 cycles**.
 
-Per group per round (with all optimizations above):
-
-| Round Type | XOR | Hash | Branch | Wrap | Addr | Total VALU |
-|-----------|-----|------|--------|------|------|-----------|
-| Normal (15 rounds) | 1 | 12 | 3 | 0 | ~1 | **17** |
-| Round 10 (wrap-to-zero) | 1 | 12 | 0 | 1 | ~1 | **15** |
-
-**Total VALU ops: 32 × (15 × 17 + 1 × 15) = 32 × 270 = 8,640**
-
-Hmm, let me recount more carefully. For round 10, we still need to load node_val and hash to update val, but idx is unconditionally set to 0:
-- Round 10: XOR(1) + hash(12) + set_zero(1) + addr_calc(1) = 15 ops/group
-- Other 15 rounds: XOR(1) + hash(12) + branch(3) + addr_calc(1) = 17 ops/group
-
-Total: 32 × (15 × 17 + 1 × 15) = 32 × 270 = **8,640 VALU ops**
-
-At 6 VALU slots/cycle: **8,640 / 6 = 1,440 cycles**
-
-Removing addr_calc for early rounds where loads are broadcast (rounds 0-5, 11-15 → 10 rounds with ≤32 unique nodes where addresses are compile-time known):
-
-- 10 "efficient" rounds: 32 × (1 + 12 + 3) = 512 VALU ops/round (no addr calc needed)
-- 5 "scattered" rounds (6-10): as above with addr calc
-  - Rounds 6-9: 32 × 17 = 544/round × 4 = 2,176
-  - Round 10: 32 × 15 = 480
-
-Total: 10 × 512 + 2,176 + 480 = 5,120 + 2,176 + 480 = **7,776 VALU ops**
-
-At 6/cycle: **7,776 / 6 = 1,296 cycles**
+So the remaining ~20 cycles are attributable to **dependency-induced bubbles** and the fact that the greedy list scheduler does not always achieve the global optimum packing even when the aggregate demand suggests it might be possible.
 
 ## 5. Data Dependency and Latency Analysis
 
@@ -305,6 +286,8 @@ But with cross-round pipelining (overlapping end of round N with start of round 
 
 ## 6. Summary: Throughput Bound Table
 
+The earlier rows are rough “path-to-optimization” estimates for simplified kernels; the final row reflects the **actual** instruction mix of the current optimized kernel in this repo.
+
 | Optimization Level | VALU Bound | Load Bound | Flow Bound | Estimated Cycles |
 |-------------------|-----------|-----------|-----------|-----------------|
 | **Baseline** (scalar, 1 op/cycle) | — | — | — | **147,734** |
@@ -314,20 +297,15 @@ But with cross-round pipelining (overlapping end of round N with start of round 
 | + eliminate flow ops | 1,536 | **2,560** | 0 | **~2,560** |
 | + shared-round loads | **1,536** | 527 | 0 | **~1,536** |
 | + skip wrap for safe rounds | **1,296** | 527 | 0 | **~1,350** |
+| **Current optimized kernel (this repo)** | **1,152** | 1,073 | 741 | **1,172** |
 
 ## 7. Theoretical Lower Bounds
 
 ### Pure throughput lower bound
 
-With all identified optimizations: **~1,296 cycles** (VALU-bound).
-
-Adding realistic overhead (initial loads, final stores, constant setup, pipeline fill/drain):
-- Setup: ~30-50 cycles
-- Per-round pipeline gaps: ~5 × 16 = 80 cycles
-
-**Estimated achievable: ~1,350-1,400 cycles**
-
-This aligns closely with the best reported result of **1,363 cycles** (Claude Opus 4.5 in improved harness).
+For the current optimized kernel’s instruction mix, the throughput roofline is **1152 cycles** (VALU-bound). The measured result (**1172 cycles**) is close enough that further improvements will likely require:
+- reducing total **VALU** demand (or shifting work to ALU without creating bubbles), and/or
+- reshaping dependencies so the scheduler can pack closer to the roofline.
 
 ### Absolute lower bound
 
@@ -342,10 +320,57 @@ If we could somehow reduce VALU demand further (e.g., discovering algebraic simp
 | Baseline | 147,734 | No parallelism |
 | VLIW scalar | ~18,532 | ALU throughput |
 | Vectorized + basic opts | ~2,164 | Load bandwidth |
-| All optimizations | ~1,363 | VALU throughput |
+| Current optimized kernel (this repo) | **1,172** | VALU/ALU throughput |
 | Theoretical load floor | ~527 | — |
 
-## 8. Key Optimization Priorities (by impact)
+## 8. Absolute Minimum Cycles (what’s the floor?)
+
+For the submission benchmark shape (`forest_height=10`, `rounds=16`, `batch_size=256`, `VLEN=8`), the best notion of “absolute minimum cycles” is a **roofline lower bound**: even with perfect scheduling and no bubbles, the ISA’s per-engine slot limits cap how much work can be issued per cycle.
+
+### 8a. A hard-ish VALU floor (functionally unavoidable)
+
+The hash has 6 stages; with this ISA the best-known decomposition is:
+- 3 affine stages (`(a + C) + (a << k)`) ⇒ **1× `multiply_add`** each
+- 3 XOR/shift stages (`(a ⊕ C) ⊕ (a >> k)` and `(a + C) ⊕ (a << k)`) ⇒ at least **1 shift + 1 XOR-combine** each, with constant-mixing pushed to ALU
+
+That gives a lower bound of **9 VALU ops / round / group** for hashing.
+
+For the rest of the loop:
+- **Node mix** needs an XOR with the selected/loaded node value every round; because the submission inputs start with `idx=0` and round 11 wraps back to `idx=0`, the two level-0 rounds always use the scalar `tree[0]` and can be done as scalar ALU XORs, so the best-case floor is **14 VALU XORs / group** (not 16).
+- **Index update** for 15 rounds needs: `b = val & 1`, `idx = 2*idx + 1`, `idx += b` ⇒ **3 VALU ops / round**. Round 10 always wraps, so it can be a single “set zero” op.
+
+Putting those together:
+- Hash: `9 × 16 = 144` VALU ops / group
+- Node XOR: `14` VALU ops / group
+- Index update: `15 × 3 + 1 = 46` VALU ops / group
+- **Total (floor): `144 + 14 + 46 = 204` VALU ops / group**
+
+Across 32 groups: `204 × 32 = 6528` VALU ops ⇒ with 6 VALU slots/cycle:
+`ceil(6528 / 6) = 1088` cycles.
+
+So **1088 cycles** is a strong candidate for the absolute floor *if* you can eliminate essentially all other VALU overhead (e.g., level-3 condition formation and scattered address formation) without increasing the critical path.
+
+### 8b. Multi-engine feasibility at that floor
+
+At 1088 cycles, the per-engine budgets are:
+- ALU: `1088 × 12 = 13056` slots
+- VALU: `1088 × 6 = 6528` slots
+- Load: `1088 × 2 = 2176` slots
+- Flow: `1088 × 1 = 1088` slots
+
+The current optimized kernel uses:
+- VALU: 6907 ops (needs ~379 fewer to fit in 6528)
+- ALU: 13682 ops (needs ~626 fewer to fit in 13056)
+
+Those gaps line up with the obvious remaining “real work” above the floor:
+- scattered address formation (currently split across VALU and ALU depending on `ADDR_ALU_MASK`)
+- level-3 condition formation (`idx+1`, masks) for `vselect` tree lookup
+
+### 8c. My best guess
+
+Given the ISA (no gather, 1-cycle ops, limited scratch) and how close the current kernel already is to its **1152-cycle** VALU roofline, I’d expect the true optimum for **fully correct values + indices** on this benchmark to be in the neighborhood of **1090–1120 cycles**, with **1088** as the most plausible absolute floor.
+
+## 9. Key Optimization Priorities (by impact)
 
 1. **Vectorize with VLEN=8** (~8× speedup potential): Convert scalar ops to VALU, use vload/vstore for contiguous data.
 
@@ -353,7 +378,7 @@ If we could somehow reduce VALU demand further (e.g., discovering algebraic simp
 
 3. **`multiply_add` for hash stages 0, 2, 4** (33% hash reduction): Collapse `(a+C)+(a<<k)` = `a*(2^k+1)+C` into a single VALU slot.
 
-4. **Eliminate flow ops** (remove flow bottleneck): Replace `select` with VALU arithmetic (`&`, `*`), freeing the flow engine entirely.
+4. **Use flow strategically**: Spend flow `vselect` slots when it reduces memory traffic or VALU pressure; don’t “eliminate flow” if it forces extra VALU ops.
 
 5. **Exploit tree traversal structure** (3.9× load reduction): Share node_val loads across elements at the same tree level in early rounds; recognize the wrap-to-zero pattern at level 10.
 
@@ -362,3 +387,7 @@ If we could somehow reduce VALU demand further (e.g., discovering algebraic simp
 7. **Software pipelining across groups** (hide latency): Overlap loads for one group with hash computation for another to keep all engines busy simultaneously.
 
 8. **Keep idx/val in scratch across rounds** (eliminate redundant loads/stores): Only load from memory at the start and store at the end, not every round.
+
+9. **Bit reuse across levels** (shave VALU ops): Preserve and reuse branch-history bits instead of recomputing offset bits from `idx` (e.g., level-2 selection).
+
+10. **Balance VALU vs ALU pressure** (improve packability): Move selected address-formation work from VALU to ALU where it reduces the VALU roofline (`ADDR_ALU_MASK`).
