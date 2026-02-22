@@ -145,7 +145,7 @@ def schedule_ops(graph):
     W_PRELOAD = int(os.environ.get("SCHED_W_PRELOAD", "50000"))
     W_LOAD_DESC = int(os.environ.get("SCHED_W_LOAD_DESC", "0"))
     W_CP = int(os.environ.get("SCHED_W_CP", "10"))
-    W_GROUP_DEFAULT = int(os.environ.get("SCHED_W_GROUP", "0"))
+    W_GROUP_DEFAULT = int(os.environ.get("SCHED_W_GROUP", "-1"))
 
     # Critical-path length (reverse topo order; ops are appended in topo order).
     cp_len = [0] * n
@@ -306,8 +306,8 @@ class KernelBuilder:
         # improves schedule quality.
         #
         # Empirically best for the reference benchmark (forest_height=10,
-        # rounds=16, batch_size=256): levels 5,6,8,10.
-        DEFAULT_ADDR_ALU_MASK = sum(1 << l for l in (5, 6, 8, 10))
+        # rounds=16, batch_size=256): levels 5,6,8.
+        DEFAULT_ADDR_ALU_MASK = sum(1 << l for l in (5, 6, 8))
         addr_alu_mask = int(os.environ.get("ADDR_ALU_MASK", str(DEFAULT_ADDR_ALU_MASK)))
 
         # ---- Compile-time known addresses ----
@@ -652,26 +652,20 @@ class KernelBuilder:
                     # Reuse previous round's branch bit (vb) as cond0 for this level:
                     # offset = idx - 3 => (offset & 1) == (prev_val & 1).
                     #
-                    # Then overwrite vb with cond1 = (idx - 3) & 2 (same-cycle WAR allowed on vb).
+                    # cond1 = (idx - 3) & 2 is actually just the level-0 branch bit (b0),
+                    # which we preserve in vb across level 1. The level-1 branch bit (b1)
+                    # is stored in vt2 (vtB) so we can use it here as cond0 without spending
+                    # extra VALU ops to recompute/derive offset bits from idx.
                     graph.add_op(
-                        "flow", ("vselect", vt1, vb, v_tree4, v_tree3),
-                        reads=vrange(vb) | vrange(v_tree4) | vrange(v_tree3),
+                        "flow", ("vselect", vt1, vt2, v_tree4, v_tree3),
+                        reads=vrange(vt2) | vrange(v_tree4) | vrange(v_tree3),
                         writes=vrange(vt1), group=g
                     )
                     graph.add_op(
-                        "flow", ("vselect", vt2, vb, v_tree6, v_tree5),
-                        reads=vrange(vb) | vrange(v_tree6) | vrange(v_tree5),
+                        # cond and dest aliasing is safe (reads occur before writes within a cycle).
+                        "flow", ("vselect", vt2, vt2, v_tree6, v_tree5),
+                        reads=vrange(vt2) | vrange(v_tree6) | vrange(v_tree5),
                         writes=vrange(vt2), group=g
-                    )
-                    graph.add_op(
-                        "valu", ("-", vb, vg_idx, v_three),
-                        reads=vrange(vg_idx) | vrange(v_three),
-                        writes=vrange(vb), group=g
-                    )
-                    graph.add_op(
-                        "valu", ("&", vb, vb, v_two),  # cond1: offset bit1 (nonzero => upper pair)
-                        reads=vrange(vb) | vrange(v_two),
-                        writes=vrange(vb), group=g
                     )
                     graph.add_op(
                         "flow", ("vselect", vt1, vb, vt2, vt1),
@@ -859,10 +853,13 @@ class KernelBuilder:
                         writes=vrange(vg_idx), group=g
                     )
                 else:
+                    # At level 1 we need the level-0 branch bit to stay live (used as cond1 at level 2),
+                    # so compute the next branch bit into vt2 (vtB) instead of clobbering vb.
+                    vb_next = vt2 if level == 1 else vb
                     graph.add_op(
-                        "valu", ("&", vb, vg_val, v_one),
+                        "valu", ("&", vb_next, vg_val, v_one),
                         reads=vrange(vg_val) | vrange(v_one),
-                        writes=vrange(vb), group=g
+                        writes=vrange(vb_next), group=g
                     )
                     graph.add_op(
                         "valu", ("multiply_add", vg_idx, vg_idx, v_two, v_one),
@@ -870,8 +867,8 @@ class KernelBuilder:
                         writes=vrange(vg_idx), group=g
                     )
                     graph.add_op(
-                        "valu", ("+", vg_idx, vg_idx, vb),
-                        reads=vrange(vg_idx) | vrange(vb),
+                        "valu", ("+", vg_idx, vg_idx, vb_next),
+                        reads=vrange(vg_idx) | vrange(vb_next),
                         writes=vrange(vg_idx), group=g
                     )
 
